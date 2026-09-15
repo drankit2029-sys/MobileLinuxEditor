@@ -1,0 +1,69 @@
+name: Build iOS Native Package
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install NPM Dependencies
+        run: npm ci
+
+      - name: Cache UTM Sysroot Dependencies
+        id: cache-sysroot
+        uses: actions/cache@v4
+        with:
+          path: sysroot-ios-tci-arm64
+          key: utm-sysroot-ios-tci-arm64
+
+      - name: Build UTM TCI Dependencies (if cache miss)
+        if: steps.cache-sysroot.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/utmapp/UTM.git _utm_build
+          cd _utm_build
+          # UTM official script to compile QEMU TCI without JIT for iOS
+          ./scripts/build_dependencies.sh -p ios-tci -a arm64
+          mv sysroot-ios-tci-arm64 ../
+          cd .. && rm -rf _utm_build
+
+      - name: Prepare Guest OS Assets
+        run: |
+          mkdir -p ios/Assets
+          cp assets/guest/vmlinuz-virt ios/Assets/
+          cp assets/guest/initramfs-virt.cpio.gz ios/Assets/
+
+      - name: CocoaPods Install
+        run: |
+          cd ios
+          pod install
+
+      - name: Compile iOS Archive
+        run: |
+          cd ios
+          xcodebuild archive \
+            -workspace MobileLinuxEditor.xcworkspace \
+            -scheme MobileLinuxEditor \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath MobileLinuxEditor.xcarchive \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MobileLinuxEditor-xcarchive
+          path: ios/MobileLinuxEditor.xcarchive

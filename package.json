@@ -1,0 +1,22 @@
+{
+  "name": "MobileLinuxEditor",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "react-native start",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@dr.pogodin/react-native-fs": "^2.28.3",
+    "react": "18.2.0",
+    "react-native": "0.74.5",
+    "react-native-webview": "^13.10.5"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.24.0",
+    "@babel/preset-env": "^7.24.0",
+    "@babel/runtime": "^7.24.0",
+    "@types/react": "^18.2.79",
+    "typescript": "^5.4.5"
+  }
+}
