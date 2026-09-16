@@ -17,7 +17,7 @@
 # Also hardened in this version:
 #  - Xcode 15.4 selected explicitly (documented pairing for RN 0.74)
 #  - RN CLI pinned to 13.6.9 (@latest = v20 needs Node 20; runner has Node 18)
-#  - @react-native/babel-preset + @react-native/metro-config pinned to 0.74.5
+#  - @react-native/babel-preset + @react-native/metro-config pinned to 0.74.89
 #    (latest targets RN 0.76+ and Metro bundling was never even reached yet,
 #     because the link failed first)
 #  - Fail-fast gate: verifies the qemu_init/main_loop/cleanup trio is
@@ -63,8 +63,8 @@ jobs:
             pkg.dependencies["react-native"] = "0.74.5";
             pkg.dependencies["react-native-fs"] = "2.20.0";
             if (!pkg.dependencies["react-native-webview"]) pkg.dependencies["react-native-webview"] = "^13.10.5";
-            pkg.devDependencies["@react-native/babel-preset"] = "0.74.5";
-            pkg.devDependencies["@react-native/metro-config"] = "0.74.5";
+            pkg.devDependencies["@react-native/babel-preset"] = "0.74.89";
+            pkg.devDependencies["@react-native/metro-config"] = "0.74.89";
             fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
             console.log("package.json normalized for RN 0.74.5");
           NODEEOF
