@@ -21,12 +21,11 @@ jobs:
 
       - name: Install NPM Dependencies
         run: |
-          # Swap @dr.pogodin/react-native-fs for clean react-native-fs
           npm uninstall @dr.pogodin/react-native-fs || true
           npm install --save --legacy-peer-deps react-native-fs@2.20.0
           npm install --save-dev --legacy-peer-deps @react-native/babel-preset @react-native/metro-config
 
-          # Backward-compatibility shim so existing code importing from @dr.pogodin resolves cleanly
+          # Backward-compatibility shim so any existing imports resolve cleanly
           node -e '
             const fs = require("fs");
             const dir = "./node_modules/@dr.pogodin/react-native-fs";
@@ -154,7 +153,7 @@ jobs:
           cd ios/UTM-QEMU
           curl -L -o UTM-SE.zip https://github.com/utmapp/UTM/releases/download/v4.5.3/UTM-SE.ipa
           unzip -q UTM-SE.zip
-          mv Payload/*.app/Frameworks/*.framework ./Frameworks/
+          mv Payload/*.app/Frameworks/* ./Frameworks/ 2>/dev/null || true
           find Frameworks -type d -name "qemu-*.framework" ! -name "qemu-aarch64-softmmu.framework" -exec rm -rf {} +
           rm -rf Payload UTM-SE.zip
 
@@ -171,19 +170,30 @@ jobs:
             s.resources    = "Resources/*"
             s.vendored_frameworks = "Frameworks/*.framework"
             s.dependency 'React-Core'
+            s.pod_target_xcconfig = { 'OTHER_LDFLAGS' => '-Wl,-ld_classic' }
+            s.user_target_xcconfig = { 'OTHER_LDFLAGS' => '-Wl,-ld_classic' }
           end
           EOF
 
-      - name: Configure Podfile
+      - name: Configure iOS Deployment Target and Linker Settings
         run: |
           cd ios
+          # 1. Update Podfile deployment target to 15.0
           perl -pi -e "s/platform :ios,.*/platform :ios, '15.0'/g" Podfile
+
+          # 2. Inject local UTM-QEMU pod if absent
           grep -q "UTM-QEMU" Podfile || perl -pi -e "s/(target 'MobileLinuxEditor' do)/\$1\n  pod 'UTM-QEMU', :path => '.\/UTM-QEMU'/g" Podfile
+
+          # 3. Align native Xcode project target to iOS 15.0
+          perl -pi -e "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;/IPHONEOS_DEPLOYMENT_TARGET = 15.0;/g" MobileLinuxEditor.xcodeproj/project.pbxproj
 
       - name: CocoaPods Install
         run: |
           cd ios
           pod install
+
+          # Inject classic linker flag across all generated CocoaPods configs
+          find "Pods/Target Support Files" -name "*.xcconfig" -exec perl -pi -e 's/OTHER_LDFLAGS = /OTHER_LDFLAGS = -Wl,-ld_classic /g' {} +
 
       - name: Compile iOS Application
         run: |
