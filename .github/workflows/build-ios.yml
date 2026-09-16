@@ -33,11 +33,15 @@ jobs:
 
       - name: Install Build Prerequisites
         run: |
-          brew install bison pkg-config nasm
-          # Prepend Homebrew's modern bison to PATH (macOS default bison is too old)
+          # Install all system-level tools required by UTM
+          brew install bison pkg-config gettext glib-utils libgpg-error nasm make meson cmake ninja
+          
+          # macOS ships with outdated versions of bison and gettext. Force the runner to use the new Homebrew versions.
           echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
-          # Install Python build dependencies
-          pip3 install --break-system-packages six pyparsing
+          echo "$(brew --prefix gettext)/bin" >> $GITHUB_PATH
+          
+          # Install all required Python modules for QEMU and GLib code generation
+          pip3 install --break-system-packages six pyparsing pyyaml setuptools distlib mako
 
       - name: Cache UTM Sysroot Dependencies
         id: cache-sysroot
