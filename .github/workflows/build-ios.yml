@@ -22,13 +22,20 @@ jobs:
       - name: Install NPM Dependencies
         run: npm ci
 
+      - name: Fix React Native Codegen Compatibility
+        run: |
+          echo "Bypassing strict Codegen for @dr.pogodin/react-native-fs..."
+          # Deleting the config file and specs folder forces CocoaPods to skip TurboModule generation 
+          # and use the standard stable native bridge for this package instead.
+          rm -rf node_modules/@dr.pogodin/react-native-fs/react-native.config.js
+          rm -rf node_modules/@dr.pogodin/react-native-fs/src/specs
+          perl -0777 -pi -e 's/"codegenConfig":\s*\{[^\}]*\}//gs' node_modules/@dr.pogodin/react-native-fs/package.json || true
+
       - name: Scaffold React Native iOS Project
         run: |
           echo "Generating pristine iOS scaffolding on macOS..."
-          # Unconditionally generate the template in a temp folder
           npx @react-native-community/cli@latest init MobileLinuxEditor --version 0.74.5 --directory ./NativeTemp --skip-install
           
-          # Ensure ios directory exists and merge the generated files (like Podfile)
           mkdir -p ios
           cp -R NativeTemp/ios/* ./ios/
           cp -n NativeTemp/app.json ./ || true
