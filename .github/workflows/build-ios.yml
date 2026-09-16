@@ -22,6 +22,15 @@ jobs:
       - name: Install NPM Dependencies
         run: npm ci
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11' # 3.11 avoids several legacy build-dep quirks in UTM
+
+      - name: Install build tool dependencies
+        run: |
+          pip install setuptools meson ninja
+
       - name: Install Build Prerequisites
         run: |
           brew install bison pkg-config nasm
