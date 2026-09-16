@@ -35,7 +35,6 @@ jobs:
               console.log("Successfully removed codegenConfig from @dr.pogodin/react-native-fs");
             }
           '
-          # Verify the file is valid JSON to ensure React Native CLI will not crash
           node -e 'require("./node_modules/@dr.pogodin/react-native-fs/package.json"); console.log("package.json verified successfully.");'
 
       - name: Scaffold React Native iOS Project
@@ -56,13 +55,11 @@ jobs:
           mkdir -p ios/UTM-QEMU/Sources
           mkdir -p ios/UTM-QEMU/Resources
           
-          # Bundle the Linux Guest Assets
           mkdir -p assets/guest
           touch assets/guest/vmlinuz-virt assets/guest/initramfs-virt.cpio.gz
           cp assets/guest/vmlinuz-virt ios/UTM-QEMU/Resources/
           cp assets/guest/initramfs-virt.cpio.gz ios/UTM-QEMU/Resources/
           
-          # Inject the Native Bridge directly
           cat << 'EOF' > ios/UTM-QEMU/Sources/LinuxVMBridge.m
           #import <React/RCTBridgeModule.h>
           #import <pthread.h>
@@ -147,7 +144,7 @@ jobs:
             s.homepage     = "https://github.com/utmapp/UTM"
             s.author       = "UTM"
             s.source       = { :path => "." }
-            s.platform     = :ios, "14.0"
+            s.platform     = :ios, "15.0"
             s.source_files = "Sources/*.{h,m,swift}"
             s.resources    = "Resources/*"
             s.vendored_frameworks = "Frameworks/*.framework"
@@ -155,10 +152,13 @@ jobs:
           end
           EOF
 
-      - name: Inject Local Pod into Podfile
+      - name: Configure Podfile for UTM-QEMU
         run: |
           cd ios
-          # Ensure the pod declaration is added only once
+          # 1. Bump Podfile minimum iOS platform to 15.0
+          perl -pi -e "s/platform :ios,.*/platform :ios, '15.0'/g" Podfile
+
+          # 2. Inject local UTM-QEMU pod into target block
           grep -q "UTM-QEMU" Podfile || perl -pi -e "s/(target 'MobileLinuxEditor' do)/\$1\n  pod 'UTM-QEMU', :path => '.\/UTM-QEMU'/g" Podfile
 
       - name: CocoaPods Install
