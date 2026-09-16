@@ -1,3 +1,27 @@
+# MobileLinuxEditor - iOS CI build (React Native 0.74.5 + headless UTM-QEMU)
+#
+# ROOT CAUSE OF THE 2026-09-16 LINK CRASH:
+#   ld: symbol(s) not found for architecture arm64, referenced from
+#   _vm_thread_worker in libUTM-QEMU.a (LinuxVMBridge.o)
+# The bridge declared `extern int qemu_main(...)`, but UTM's QEMU frameworks
+# do NOT export `qemu_main`. Verified against utmapp/UTM sources
+# (Services/UTMQemuSystem.m, QEMULauncher/Bootstrap.c): UTM loads QEMU via
+#   dlopen("qemu-<arch>-softmmu.framework/qemu-<arch>-softmmu")
+#   dlsym("qemu_init")      -> int (int argc, const char *argv[], const char *envp[])
+#   dlsym("qemu_main_loop") -> void (void)
+#   dlsym("qemu_cleanup")   -> void (void)
+# then calls qemu_init(argc, argv, envp); qemu_main_loop(); qemu_cleanup();
+# This workflow's LinuxVMBridge.m now does exactly the same, so there are
+# ZERO link-time QEMU symbol dependencies and the link crash is gone.
+#
+# Also hardened in this version:
+#  - Xcode 15.4 selected explicitly (documented pairing for RN 0.74)
+#  - RN CLI pinned to 13.6.9 (@latest = v20 needs Node 20; runner has Node 18)
+#  - @react-native/babel-preset + @react-native/metro-config pinned to 0.74.5
+#    (latest targets RN 0.76+ and Metro bundling was never even reached yet,
+#     because the link failed first)
+#  - Fail-fast gate: verifies the qemu_init/main_loop/cleanup trio is
+#    exported by the downloaded framework BEFORE compiling
 name: Build iOS Native Package
 
 on:
@@ -8,117 +32,207 @@ on:
 jobs:
   build:
     runs-on: macos-14
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
+      - name: Select Xcode 15.4 (matches RN 0.74)
+        run: |
+          if [ -d "/Applications/Xcode_15.4.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_15.4.app
+          else
+            echo "NOTE: Xcode_15.4.app not on runner, using default Xcode"
+            ls /Applications/ | grep -i xcode || true
+          fi
+          xcodebuild -version
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 18
-          cache: 'npm'
 
       - name: Install NPM Dependencies
         run: |
-          npm uninstall @dr.pogodin/react-native-fs || true
-          npm install --save --legacy-peer-deps react-native-fs@2.20.0
-          npm install --save-dev --legacy-peer-deps @react-native/babel-preset @react-native/metro-config
-
-          # Backward-compatibility shim
-          node -e '
+          node << 'NODEEOF'
+            const fs = require("fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            pkg.dependencies = pkg.dependencies || {};
+            pkg.devDependencies = pkg.devDependencies || {};
+            delete pkg.dependencies["@dr.pogodin/react-native-fs"];
+            pkg.dependencies["react"] = "18.2.0";
+            pkg.dependencies["react-native"] = "0.74.5";
+            pkg.dependencies["react-native-fs"] = "2.20.0";
+            if (!pkg.dependencies["react-native-webview"]) pkg.dependencies["react-native-webview"] = "^13.10.5";
+            pkg.devDependencies["@react-native/babel-preset"] = "0.74.5";
+            pkg.devDependencies["@react-native/metro-config"] = "0.74.5";
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+            console.log("package.json normalized for RN 0.74.5");
+          NODEEOF
+          npm install --legacy-peer-deps
+          node << 'NODEEOF'
             const fs = require("fs");
             const dir = "./node_modules/@dr.pogodin/react-native-fs";
             fs.mkdirSync(dir, { recursive: true });
-            fs.writeFileSync(dir + "/package.json", JSON.stringify({ name: "@dr.pogodin/react-native-fs", main: "index.js" }));
+            fs.writeFileSync(dir + "/package.json", JSON.stringify({ name: "@dr.pogodin/react-native-fs", version: "0.0.0-shim", main: "index.js" }, null, 2));
             fs.writeFileSync(dir + "/index.js", "module.exports = require(\"react-native-fs\");\n");
-          '
+            console.log("backward-compat shim installed");
+          NODEEOF
 
       - name: Configure Babel, Metro, and App Starter
         run: |
-          node -e '
+          node << 'NODEEOF'
             const fs = require("fs");
             fs.writeFileSync("babel.config.js", "module.exports = { presets: [\"module:@react-native/babel-preset\"] };\n");
-            fs.writeFileSync("metro.config.js", "const {getDefaultConfig, mergeConfig} = require(\"@react-native/metro-config\");\nmodule.exports = mergeConfig(getDefaultConfig(__dirname), {});\n");
+            fs.writeFileSync("metro.config.js", "const { getDefaultConfig, mergeConfig } = require(\"@react-native/metro-config\");\nmodule.exports = mergeConfig(getDefaultConfig(__dirname), {});\n");
+            console.log("babel.config.js + metro.config.js written");
             if (!fs.existsSync("App.tsx") || fs.readFileSync("App.tsx", "utf8").trim().length === 0) {
-              fs.writeFileSync("App.tsx", `import React from "react";
-            import { SafeAreaView, Text, StyleSheet } from "react-native";
-
-            export default function App() {
-              return (
-                <SafeAreaView style={styles.container}>
-                  <Text style={styles.text}>Mobile Linux Editor</Text>
-                </SafeAreaView>
-              );
+              fs.writeFileSync("App.tsx", [
+                "import React from 'react';",
+                "import { SafeAreaView, Text, StyleSheet } from 'react-native';",
+                "",
+                "export default function App() {",
+                "  return (",
+                "    <SafeAreaView style={styles.container}>",
+                "      <Text style={styles.text}>Mobile Linux Editor</Text>",
+                "    </SafeAreaView>",
+                "  );",
+                "}",
+                "",
+                "const styles = StyleSheet.create({",
+                "  container: { flex: 1, backgroundColor: '#1e1e1e', justifyContent: 'center', alignItems: 'center' },",
+                "  text: { color: '#ffffff', fontSize: 20 },",
+                "});",
+                ""
+              ].join("\n"));
+              console.log("App.tsx starter written");
+            } else {
+              console.log("App.tsx already exists, kept as-is");
             }
-
-            const styles = StyleSheet.create({
-              container: { flex: 1, backgroundColor: "#1e1e1e", justifyContent: "center", alignItems: "center" },
-              text: { color: "#ffffff", fontSize: 20 }
-            });
-            `);
-            }
-          '
+          NODEEOF
 
       - name: Scaffold React Native iOS Project
         run: |
-          npx @react-native-community/cli@latest init MobileLinuxEditor --version 0.74.5 --directory ./NativeTemp --skip-install
+          npx @react-native-community/cli@13.6.9 init MobileLinuxEditor --version 0.74.5 --directory ./NativeTemp --skip-install
           mkdir -p ios
           cp -R NativeTemp/ios/. ./ios/
           cp -n NativeTemp/app.json ./ || true
           cp -n NativeTemp/index.js ./ || true
           rm -rf NativeTemp
+          ls ios
 
       - name: Configure React Native Node Environment
         run: |
           echo "export NODE_BINARY=$(which node)" > ios/.xcode.env.local
+          cat ios/.xcode.env.local
 
       - name: Assemble UTM-QEMU Local Pod (Headless Engine)
         run: |
           mkdir -p ios/UTM-QEMU/Frameworks
           mkdir -p ios/UTM-QEMU/Sources
           mkdir -p ios/UTM-QEMU/Resources
-          
+
           mkdir -p assets/guest
           [ -f assets/guest/vmlinuz-virt ] || touch assets/guest/vmlinuz-virt
           [ -f assets/guest/initramfs-virt.cpio.gz ] || touch assets/guest/initramfs-virt.cpio.gz
           cp assets/guest/vmlinuz-virt ios/UTM-QEMU/Resources/
           cp assets/guest/initramfs-virt.cpio.gz ios/UTM-QEMU/Resources/
-          
+
           cat << 'EOF' > ios/UTM-QEMU/Sources/LinuxVMBridge.m
           #import <React/RCTBridgeModule.h>
           #import <pthread.h>
+          #import <dlfcn.h>
 
-          extern int qemu_main(int argc, char **argv);
+          extern char **environ;
 
           @interface LinuxVMBridge : NSObject <RCTBridgeModule>
           @end
 
-          @implementation LinuxVMBridge { BOOL _isRunning; }
+          // UTM's QEMU frameworks expose NO link-time entry point. Like UTM itself
+          // (UTMQemuSystem.m / QEMULauncher/Bootstrap.c), we dlopen() the framework
+          // and resolve this trio at runtime:
+          //   int  qemu_init(int argc, const char *argv[], const char *envp[])
+          //   void qemu_main_loop(void)
+          //   void qemu_cleanup(void)
+          typedef int (*QEMUInitFunc)(int argc, const char *argv[], const char *envp[]);
+          typedef void (*QEMUMainLoopFunc)(void);
+          typedef void (*QEMUCleanupFunc)(void);
+
+          typedef struct {
+              QEMUInitFunc qemu_init;
+              QEMUMainLoopFunc qemu_main_loop;
+              QEMUCleanupFunc qemu_cleanup;
+              int argc;
+              char **argv;
+          } VMThreadArgs;
+
+          @implementation LinuxVMBridge {
+              BOOL _isRunning;
+          }
 
           RCT_EXPORT_MODULE();
 
-          + (BOOL)requiresMainQueueSetup { return NO; }
+          + (BOOL)requiresMainQueueSetup {
+              return NO;
+          }
 
           static void *vm_thread_worker(void *arg) {
-              char **argv = (char **)arg;
-              int argc = 0;
-              while (argv[argc] != NULL) argc++;
-              qemu_main(argc, argv);
-              for (int i = 0; i < argc; i++) free(argv[i]);
-              free(argv);
+              VMThreadArgs *t = (VMThreadArgs *)arg;
+              int ret = t->qemu_init(t->argc,
+                                     (const char **)t->argv,
+                                     (const char **)environ);
+              if (ret == 0) {
+                  t->qemu_main_loop();
+                  t->qemu_cleanup();
+              }
+              for (int i = 0; i < t->argc; i++) {
+                  free(t->argv[i]);
+              }
+              free(t->argv);
+              free(t);
               return NULL;
           }
 
           RCT_EXPORT_METHOD(startVM:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
-              if (_isRunning) { resolve(@"VM is already running"); return; }
-              
+              if (_isRunning) {
+                  resolve(@"VM is already running");
+                  return;
+              }
+
+              // CocoaPods embeds vendored frameworks into <App>.app/Frameworks/
+              NSString *frameworkBinary = @"qemu-aarch64-softmmu.framework/qemu-aarch64-softmmu";
+              NSString *rpathForm = [@"@rpath/" stringByAppendingString:frameworkBinary];
+              NSString *bundleForm = [[[[NSBundle mainBundle] bundlePath]
+                  stringByAppendingPathComponent:@"Frameworks"]
+                  stringByAppendingPathComponent:frameworkBinary];
+
+              void *handle = dlopen([rpathForm UTF8String], RTLD_LOCAL | RTLD_LAZY);
+              if (!handle) {
+                  handle = dlopen([bundleForm UTF8String], RTLD_LOCAL | RTLD_LAZY);
+              }
+              if (!handle) {
+                  const char *err = dlerror();
+                  reject(@"ERR_VM_LOAD",
+                         [NSString stringWithFormat:@"dlopen QEMU failed: %s",
+                          err ? err : "unknown error"], nil);
+                  return;
+              }
+
+              QEMUInitFunc qemu_init = (QEMUInitFunc)dlsym(handle, "qemu_init");
+              QEMUMainLoopFunc qemu_main_loop = (QEMUMainLoopFunc)dlsym(handle, "qemu_main_loop");
+              QEMUCleanupFunc qemu_cleanup = (QEMUCleanupFunc)dlsym(handle, "qemu_cleanup");
+              if (!qemu_init || !qemu_main_loop || !qemu_cleanup) {
+                  dlclose(handle);
+                  reject(@"ERR_VM_SYMBOLS",
+                         @"QEMU entry points (qemu_init/main_loop/cleanup) not found", nil);
+                  return;
+              }
+
               NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
               NSString *workspace = [docs stringByAppendingPathComponent:@"workspace"];
               NSString *bundle = [[NSBundle mainBundle] bundlePath];
-              
+
               [[NSFileManager defaultManager] createDirectoryAtPath:workspace withIntermediateDirectories:YES attributes:nil error:nil];
-              
+
               NSArray<NSString *> *qemuArgs = @[
                   @"qemu-system-aarch64", @"-M", @"virt", @"-cpu", @"cortex-a57", @"-smp", @"1", @"-m", @"512M",
                   @"-kernel", [bundle stringByAppendingPathComponent:@"vmlinuz-virt"],
@@ -131,42 +245,67 @@ jobs:
                   @"-chardev", @"socket,id=serial0,port=4000,host=127.0.0.1,server=on,wait=off",
                   @"-serial", @"chardev:serial0", @"-nographic"
               ];
-              
+
               int count = (int)[qemuArgs count];
-              char **argv = malloc(sizeof(char *) * (count + 1));
-              for (int i = 0; i < count; i++) argv[i] = strdup([[qemuArgs objectAtIndex:i] UTF8String]);
-              argv[count] = NULL;
-              
+              VMThreadArgs *t = calloc(1, sizeof(VMThreadArgs));
+              t->qemu_init = qemu_init;
+              t->qemu_main_loop = qemu_main_loop;
+              t->qemu_cleanup = qemu_cleanup;
+              t->argc = count;
+              t->argv = malloc(sizeof(char *) * (count + 1));
+              for (int i = 0; i < count; i++) {
+                  t->argv[i] = strdup([[qemuArgs objectAtIndex:i] UTF8String]);
+              }
+              t->argv[count] = NULL;
+
               pthread_t thread;
-              if (pthread_create(&thread, NULL, vm_thread_worker, (void *)argv) != 0) {
-                  free(argv);
+              if (pthread_create(&thread, NULL, vm_thread_worker, t) != 0) {
+                  for (int i = 0; i < count; i++) {
+                      free(t->argv[i]);
+                  }
+                  free(t->argv);
+                  free(t);
+                  dlclose(handle);
                   reject(@"ERR_VM_THREAD", @"Failed to spawn QEMU pthread", nil);
                   return;
               }
               pthread_detach(thread);
               _isRunning = YES;
+              // NOTE: dlopen handle intentionally kept open for app lifetime (same as UTM).
               resolve(@"VM initialized on port 4000");
           }
+
           @end
           EOF
-          
+
           cd ios/UTM-QEMU
-          curl -L -o UTM-SE.zip https://github.com/utmapp/UTM/releases/download/v4.5.3/UTM-SE.ipa
+          curl -fSL -o UTM-SE.zip https://github.com/utmapp/UTM/releases/download/v4.5.3/UTM-SE.ipa
           unzip -q UTM-SE.zip
           mv Payload/*.app/Frameworks/* ./Frameworks/ 2>/dev/null || true
-
-          # Keep only the aarch64 softmmu architecture
+          echo "--- Frameworks before pruning ---"
+          ls Frameworks
           find Frameworks -type d -name "qemu-*.framework" ! -name "qemu-aarch64-softmmu.framework" -exec rm -rf {} +
-
-          # Remove GUI display and Spice frameworks to prevent allowable_client linker errors
           rm -rf Frameworks/GLESv2.framework
           rm -rf Frameworks/EGL.framework
           rm -rf Frameworks/virglrenderer.*
           rm -rf Frameworks/spice-*
           rm -rf Frameworks/phodav.*
           rm -rf Frameworks/gst*
-
           rm -rf Payload UTM-SE.zip
+          echo "--- Frameworks after pruning ---"
+          ls Frameworks
+          echo "--- QEMU framework linked dependencies (for runtime diagnosis) ---"
+          QEMU_FW=Frameworks/qemu-aarch64-softmmu.framework
+          QEMU_BIN="$QEMU_FW/qemu-aarch64-softmmu"
+          [ -f "$QEMU_BIN" ] || QEMU_BIN=$(find "$QEMU_FW" -maxdepth 1 -type f ! -name "*.plist" | head -n 1)
+          echo "QEMU binary: $QEMU_BIN"
+          otool -L "$QEMU_BIN" || true
+          echo "--- Fail-fast gate: QEMU entry trio must be exported ---"
+          NM_OUT=$(nm -gU "$QEMU_BIN" 2>/dev/null || true)
+          echo "$NM_OUT" | grep -q "T _qemu_init" || { echo "FATAL: _qemu_init not exported by QEMU framework"; exit 1; }
+          echo "$NM_OUT" | grep -q "T _qemu_main_loop" || { echo "FATAL: _qemu_main_loop not exported by QEMU framework"; exit 1; }
+          echo "$NM_OUT" | grep -q "T _qemu_cleanup" || { echo "FATAL: _qemu_cleanup not exported by QEMU framework"; exit 1; }
+          echo "OK: qemu_init / qemu_main_loop / qemu_cleanup all exported."
 
           cat << 'EOF' > UTM-QEMU.podspec
           Pod::Spec.new do |s|
@@ -187,19 +326,18 @@ jobs:
       - name: Configure iOS Deployment Target
         run: |
           cd ios
-          # 1. Update Podfile deployment target to 15.0
           perl -pi -e "s/platform :ios,.*/platform :ios, '15.0'/g" Podfile
-
-          # 2. Inject local UTM-QEMU pod if absent
           grep -q "UTM-QEMU" Podfile || perl -pi -e "s/(target 'MobileLinuxEditor' do)/\$1\n  pod 'UTM-QEMU', :path => '.\/UTM-QEMU'/g" Podfile
-
-          # 3. Align native Xcode project target to iOS 15.0
           perl -pi -e "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;/IPHONEOS_DEPLOYMENT_TARGET = 15.0;/g" MobileLinuxEditor.xcodeproj/project.pbxproj
+          echo "--- Podfile (top 30 lines) ---"
+          head -n 30 Podfile
+          pod --version
 
       - name: CocoaPods Install
         run: |
           cd ios
-          pod install
+          set -o pipefail
+          pod install 2>&1 | tail -n 60
 
       - name: Compile iOS Application
         run: |
@@ -216,22 +354,32 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO > xcodebuild.log 2>&1 || {
               echo "=== BUILD FAILED: COMPACT ERROR SUMMARY ==="
-              grep -E -C 2 "(error:|fatal error:|The following build commands failed)" xcodebuild.log || tail -n 80 xcodebuild.log
+              grep -E -B 8 -A 2 "(error:|fatal error:|The following build commands failed)" xcodebuild.log || tail -n 80 xcodebuild.log
               exit 1
             }
+          echo "BUILD SUCCEEDED"
 
       - name: Package Unsigned IPA
         run: |
           mkdir -p build/Payload
           APP_PATH=$(find ios/build_output/Build/Products/Release-iphoneos -name "*.app" -type d | head -n 1)
           echo "Found compiled app at: $APP_PATH"
+          test -n "$APP_PATH" || { echo "ERROR: no .app found"; exit 1; }
           cp -R "$APP_PATH" build/Payload/
           cd build
           zip -qr MobileLinuxEditor.ipa Payload
           echo "Successfully created MobileLinuxEditor.ipa"
+          ls -lh MobileLinuxEditor.ipa
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
           name: MobileLinuxEditor-IPA
           path: build/MobileLinuxEditor.ipa
+
+      - name: Upload full build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ios/xcodebuild.log
