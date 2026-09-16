@@ -21,8 +21,19 @@ jobs:
 
       - name: Install NPM Dependencies
         run: |
-          npm ci || npm install --legacy-peer-deps
+          # Swap @dr.pogodin/react-native-fs for clean react-native-fs
+          npm uninstall @dr.pogodin/react-native-fs || true
+          npm install --save --legacy-peer-deps react-native-fs@2.20.0
           npm install --save-dev --legacy-peer-deps @react-native/babel-preset @react-native/metro-config
+
+          # Backward-compatibility shim so existing code importing from @dr.pogodin resolves cleanly
+          node -e '
+            const fs = require("fs");
+            const dir = "./node_modules/@dr.pogodin/react-native-fs";
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(dir + "/package.json", JSON.stringify({ name: "@dr.pogodin/react-native-fs", main: "index.js" }));
+            fs.writeFileSync(dir + "/index.js", "module.exports = require(\"react-native-fs\");\n");
+          '
 
       - name: Configure Babel, Metro, and App Starter
         run: |
@@ -47,18 +58,6 @@ jobs:
               text: { color: "#ffffff", fontSize: 20 }
             });
             `);
-            }
-          '
-
-      - name: Fix React Native Codegen Compatibility
-        run: |
-          node -e '
-            const fs = require("fs");
-            const file = "./node_modules/@dr.pogodin/react-native-fs/package.json";
-            if (fs.existsSync(file)) {
-              const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
-              delete pkg.codegenConfig;
-              fs.writeFileSync(file, JSON.stringify(pkg, null, 2));
             }
           '
 
