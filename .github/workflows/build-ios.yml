@@ -55,7 +55,30 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/utmapp/UTM.git _utm_build
           cd _utm_build
-          ./scripts/build_dependencies.sh -p ios-tci -a arm64
+          
+          echo "Starting heavy compilation. Limiting threads to prevent Out-of-Memory crashes."
+          export MAKEFLAGS="-j3"
+          
+          # Route output to a file to prevent GitHub from killing the step due to log limits
+          ./scripts/build_dependencies.sh -p ios-tci -a arm64 > build_log.txt 2>&1 &
+          PID=$!
+          
+          # Keep the console alive so GitHub doesn't trigger the 10-minute inactivity timeout
+          while kill -0 $PID 2>/dev/null; do
+            echo "[$(date)] Working... Current task:"
+            tail -n 1 build_log.txt || true
+            sleep 60
+          done
+          
+          # Retrieve the final exit code of the build script
+          wait $PID
+          if [ $? -ne 0 ]; then
+            echo "== BUILD CRASHED =="
+            echo "Printing the last 200 lines of the log for debugging:"
+            tail -n 200 build_log.txt
+            exit 1
+          fi
+          
           mv sysroot-ios-tci-arm64 ../
           cd .. && rm -rf _utm_build
 
