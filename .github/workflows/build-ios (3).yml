@@ -1,5 +1,9 @@
 # MobileLinuxEditor - iOS CI build (React Native 0.74.5 + headless UTM-QEMU)
 #
+# v4: TARGETED_DEVICE_FAMILY replace-or-INSERT (template omits the key);
+#     minimal prune (ONLY EGL/GLESv2 are restricted; spice/virgl/epoxy are
+#     LC_LOADed by QEMU itself and must stay for runtime dlopen);
+#     @rpath-embed gate + transitive EGL/GLES audit; SIGPIPE-free symbol gate.
 # v3: universal iPhone/iPad layout + launch-crash hardening
 #  - TARGETED_DEVICE_FAMILY = "1,2" (was iPhone-only -> tiny window on iPad)
 #  - Info.plist: UIRequiresFullScreen=true + all 4 iPad orientations
@@ -285,12 +289,12 @@ jobs:
           echo "--- Frameworks before pruning ---"
           ls Frameworks
           find Frameworks -type d -name "qemu-*.framework" ! -name "qemu-aarch64-softmmu.framework" -exec rm -rf {} +
+          # MINIMAL prune: ONLY the ANGLE frameworks carry Apple's
+          # allowable_client restriction (verified: all others link clean).
+          # spice-server / virglrenderer / epoxy are LC_LOADed by the QEMU
+          # framework itself, so removing them breaks dlopen at runtime.
           rm -rf Frameworks/GLESv2.framework
           rm -rf Frameworks/EGL.framework
-          rm -rf Frameworks/virglrenderer.*
-          rm -rf Frameworks/spice-*
-          rm -rf Frameworks/phodav.*
-          rm -rf Frameworks/gst*
           rm -rf Payload UTM-SE.zip
           echo "--- Frameworks after pruning ---"
           ls Frameworks
@@ -302,10 +306,22 @@ jobs:
           otool -L "$QEMU_BIN" || true
           echo "--- Fail-fast gate: QEMU entry trio must be exported ---"
           NM_OUT=$(nm -gU "$QEMU_BIN" 2>/dev/null || true)
-          echo "$NM_OUT" | grep -q "T _qemu_init" || { echo "FATAL: _qemu_init not exported by QEMU framework"; exit 1; }
-          echo "$NM_OUT" | grep -q "T _qemu_main_loop" || { echo "FATAL: _qemu_main_loop not exported by QEMU framework"; exit 1; }
-          echo "$NM_OUT" | grep -q "T _qemu_cleanup" || { echo "FATAL: _qemu_cleanup not exported by QEMU framework"; exit 1; }
+          grep -q "T _qemu_init" <<< "$NM_OUT" || { echo "FATAL: _qemu_init not exported by QEMU framework"; exit 1; }
+          grep -q "T _qemu_main_loop" <<< "$NM_OUT" || { echo "FATAL: _qemu_main_loop not exported by QEMU framework"; exit 1; }
+          grep -q "T _qemu_cleanup" <<< "$NM_OUT" || { echo "FATAL: _qemu_cleanup not exported by QEMU framework"; exit 1; }
           echo "OK: qemu_init / qemu_main_loop / qemu_cleanup all exported."
+          echo "--- Gate: every qemu @rpath dep must be embedded (else dlopen fails) ---"
+          MISSING=0
+          for DEP in $(otool -L "$QEMU_BIN" | grep "@rpath" | awk '{print $1}' | sed 's|@rpath/||'); do
+            if [ ! -e "Frameworks/$DEP" ]; then echo "MISSING: Frameworks/$DEP"; MISSING=1; fi
+          done
+          [ "$MISSING" -eq 0 ] || { echo "FATAL: QEMU has unembedded @rpath dependencies (see MISSING above)"; exit 1; }
+          echo "OK: all qemu @rpath dependencies embedded."
+          echo "--- Audit: does any kept framework still LC_LOAD the removed EGL/GLESv2? ---"
+          for FWBIN in Frameworks/epoxy.0.framework/epoxy.0 Frameworks/spice-server.1.framework/spice-server.1 Frameworks/virglrenderer.1.framework/virglrenderer.1; do
+            echo "== $FWBIN"
+            otool -L "$FWBIN" 2>/dev/null | grep -iE "egl|gles" || echo "   (no EGL/GLESv2 linkage)"
+          done
 
           cat << 'EOF' > UTM-QEMU.podspec
           Pod::Spec.new do |s|
@@ -329,10 +345,16 @@ jobs:
           perl -pi -e "s/platform :ios,.*/platform :ios, '15.0'/g" Podfile
           grep -q "UTM-QEMU" Podfile || perl -pi -e "s/(target 'MobileLinuxEditor' do)/\$1\n  pod 'UTM-QEMU', :path => '.\/UTM-QEMU'/g" Podfile
           perl -pi -e "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;/IPHONEOS_DEPLOYMENT_TARGET = 15.0;/g" MobileLinuxEditor.xcodeproj/project.pbxproj
-          # Universal app: 1 = iPhone, 2 = iPad (template default is iPhone-only)
-          perl -pi -e "s/TARGETED_DEVICE_FAMILY = [^;]*;/TARGETED_DEVICE_FAMILY = \"1,2\";/g" MobileLinuxEditor.xcodeproj/project.pbxproj
+          # Universal app: 1 = iPhone, 2 = iPad. The RN 0.74 template OMITS
+          # TARGETED_DEVICE_FAMILY entirely (effective default: iPhone-only),
+          # so replace it when present, else insert into every buildSettings block.
+          if grep -q "TARGETED_DEVICE_FAMILY" MobileLinuxEditor.xcodeproj/project.pbxproj; then
+            perl -pi -e 's/TARGETED_DEVICE_FAMILY = [^;]*;/TARGETED_DEVICE_FAMILY = "1,2";/g' MobileLinuxEditor.xcodeproj/project.pbxproj
+          else
+            perl -pi -e 's/(buildSettings\s*=\s*\{\n)/$1\t\t\t\tTARGETED_DEVICE_FAMILY = "1,2";\n/g' MobileLinuxEditor.xcodeproj/project.pbxproj
+          fi
           echo "--- Device family now ---"
-          grep -m 2 "TARGETED_DEVICE_FAMILY" MobileLinuxEditor.xcodeproj/project.pbxproj
+          grep "TARGETED_DEVICE_FAMILY" MobileLinuxEditor.xcodeproj/project.pbxproj || { echo "FATAL: TARGETED_DEVICE_FAMILY still missing"; exit 1; }
           echo "--- Podfile (top 30 lines) ---"
           head -n 30 Podfile
           pod --version
