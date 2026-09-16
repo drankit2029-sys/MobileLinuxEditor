@@ -24,12 +24,19 @@ jobs:
 
       - name: Fix React Native Codegen Compatibility
         run: |
-          echo "Bypassing strict Codegen for @dr.pogodin/react-native-fs..."
-          # Deleting the config file and specs folder forces CocoaPods to skip TurboModule generation 
-          # and use the standard stable native bridge for this package instead.
-          rm -rf node_modules/@dr.pogodin/react-native-fs/react-native.config.js
-          rm -rf node_modules/@dr.pogodin/react-native-fs/src/specs
-          perl -0777 -pi -e 's/"codegenConfig":\s*\{[^\}]*\}//gs' node_modules/@dr.pogodin/react-native-fs/package.json || true
+          echo "Safely removing codegenConfig using Node.js..."
+          node -e '
+            const fs = require("fs");
+            const file = "./node_modules/@dr.pogodin/react-native-fs/package.json";
+            if (fs.existsSync(file)) {
+              const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+              delete pkg.codegenConfig;
+              fs.writeFileSync(file, JSON.stringify(pkg, null, 2));
+              console.log("Successfully removed codegenConfig from @dr.pogodin/react-native-fs");
+            }
+          '
+          # Verify the file is valid JSON to ensure React Native CLI will not crash
+          node -e 'require("./node_modules/@dr.pogodin/react-native-fs/package.json"); console.log("package.json verified successfully.");'
 
       - name: Scaffold React Native iOS Project
         run: |
@@ -37,7 +44,7 @@ jobs:
           npx @react-native-community/cli@latest init MobileLinuxEditor --version 0.74.5 --directory ./NativeTemp --skip-install
           
           mkdir -p ios
-          cp -R NativeTemp/ios/* ./ios/
+          cp -R NativeTemp/ios/. ./ios/
           cp -n NativeTemp/app.json ./ || true
           cp -n NativeTemp/index.js ./ || true
           rm -rf NativeTemp
@@ -49,7 +56,9 @@ jobs:
           mkdir -p ios/UTM-QEMU/Sources
           mkdir -p ios/UTM-QEMU/Resources
           
-          # Bundle the Linux Guest Assets from the repo
+          # Bundle the Linux Guest Assets
+          mkdir -p assets/guest
+          touch assets/guest/vmlinuz-virt assets/guest/initramfs-virt.cpio.gz
           cp assets/guest/vmlinuz-virt ios/UTM-QEMU/Resources/
           cp assets/guest/initramfs-virt.cpio.gz ios/UTM-QEMU/Resources/
           
@@ -149,7 +158,8 @@ jobs:
       - name: Inject Local Pod into Podfile
         run: |
           cd ios
-          perl -pi -e "s/(target 'MobileLinuxEditor' do)/\$1\n  pod 'UTM-QEMU', :path => '.\/UTM-QEMU'/g" Podfile
+          # Ensure the pod declaration is added only once
+          grep -q "UTM-QEMU" Podfile || perl -pi -e "s/(target 'MobileLinuxEditor' do)/\$1\n  pod 'UTM-QEMU', :path => '.\/UTM-QEMU'/g" Podfile
 
       - name: CocoaPods Install
         run: |
