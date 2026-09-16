@@ -22,6 +22,14 @@ jobs:
       - name: Install NPM Dependencies
         run: npm ci
 
+      - name: Install Build Prerequisites
+        run: |
+          brew install bison pkg-config nasm
+          # Prepend Homebrew's modern bison to PATH (macOS default bison is too old)
+          echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
+          # Install Python build dependencies
+          pip3 install --break-system-packages six pyparsing
+
       - name: Cache UTM Sysroot Dependencies
         id: cache-sysroot
         uses: actions/cache@v4
@@ -34,7 +42,6 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/utmapp/UTM.git _utm_build
           cd _utm_build
-          # UTM official script to compile QEMU TCI without JIT for iOS
           ./scripts/build_dependencies.sh -p ios-tci -a arm64
           mv sysroot-ios-tci-arm64 ../
           cd .. && rm -rf _utm_build
