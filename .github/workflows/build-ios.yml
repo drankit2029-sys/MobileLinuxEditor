@@ -25,7 +25,7 @@ jobs:
           npm install --save --legacy-peer-deps react-native-fs@2.20.0
           npm install --save-dev --legacy-peer-deps @react-native/babel-preset @react-native/metro-config
 
-          # Backward-compatibility shim so any existing imports resolve cleanly
+          # Backward-compatibility shim
           node -e '
             const fs = require("fs");
             const dir = "./node_modules/@dr.pogodin/react-native-fs";
@@ -73,7 +73,7 @@ jobs:
         run: |
           echo "export NODE_BINARY=$(which node)" > ios/.xcode.env.local
 
-      - name: Assemble UTM-QEMU Local Pod
+      - name: Assemble UTM-QEMU Local Pod (Headless Engine)
         run: |
           mkdir -p ios/UTM-QEMU/Frameworks
           mkdir -p ios/UTM-QEMU/Sources
@@ -154,14 +154,25 @@ jobs:
           curl -L -o UTM-SE.zip https://github.com/utmapp/UTM/releases/download/v4.5.3/UTM-SE.ipa
           unzip -q UTM-SE.zip
           mv Payload/*.app/Frameworks/* ./Frameworks/ 2>/dev/null || true
+
+          # Keep only the aarch64 softmmu architecture
           find Frameworks -type d -name "qemu-*.framework" ! -name "qemu-aarch64-softmmu.framework" -exec rm -rf {} +
+
+          # Remove GUI display and Spice frameworks to prevent allowable_client linker errors
+          rm -rf Frameworks/GLESv2.framework
+          rm -rf Frameworks/EGL.framework
+          rm -rf Frameworks/virglrenderer.*
+          rm -rf Frameworks/spice-*
+          rm -rf Frameworks/phodav.*
+          rm -rf Frameworks/gst*
+
           rm -rf Payload UTM-SE.zip
 
           cat << 'EOF' > UTM-QEMU.podspec
           Pod::Spec.new do |s|
             s.name         = "UTM-QEMU"
             s.version      = "1.0.0"
-            s.summary      = "Prebuilt QEMU for iOS"
+            s.summary      = "Headless QEMU for iOS"
             s.homepage     = "https://github.com/utmapp/UTM"
             s.author       = "UTM"
             s.source       = { :path => "." }
@@ -170,12 +181,10 @@ jobs:
             s.resources    = "Resources/*"
             s.vendored_frameworks = "Frameworks/*.framework"
             s.dependency 'React-Core'
-            s.pod_target_xcconfig = { 'OTHER_LDFLAGS' => '-Wl,-ld_classic' }
-            s.user_target_xcconfig = { 'OTHER_LDFLAGS' => '-Wl,-ld_classic' }
           end
           EOF
 
-      - name: Configure iOS Deployment Target and Linker Settings
+      - name: Configure iOS Deployment Target
         run: |
           cd ios
           # 1. Update Podfile deployment target to 15.0
@@ -191,9 +200,6 @@ jobs:
         run: |
           cd ios
           pod install
-
-          # Inject classic linker flag across all generated CocoaPods configs
-          find "Pods/Target Support Files" -name "*.xcconfig" -exec perl -pi -e 's/OTHER_LDFLAGS = /OTHER_LDFLAGS = -Wl,-ld_classic /g' {} +
 
       - name: Compile iOS Application
         run: |
