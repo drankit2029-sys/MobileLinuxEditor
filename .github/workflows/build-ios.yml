@@ -24,7 +24,6 @@ jobs:
 
       - name: Fix React Native Codegen Compatibility
         run: |
-          echo "Safely removing codegenConfig using Node.js..."
           node -e '
             const fs = require("fs");
             const file = "./node_modules/@dr.pogodin/react-native-fs/package.json";
@@ -32,31 +31,32 @@ jobs:
               const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
               delete pkg.codegenConfig;
               fs.writeFileSync(file, JSON.stringify(pkg, null, 2));
-              console.log("Successfully removed codegenConfig from @dr.pogodin/react-native-fs");
             }
           '
-          node -e 'require("./node_modules/@dr.pogodin/react-native-fs/package.json"); console.log("package.json verified successfully.");'
 
       - name: Scaffold React Native iOS Project
         run: |
-          echo "Generating pristine iOS scaffolding on macOS..."
           npx @react-native-community/cli@latest init MobileLinuxEditor --version 0.74.5 --directory ./NativeTemp --skip-install
-          
           mkdir -p ios
           cp -R NativeTemp/ios/. ./ios/
           cp -n NativeTemp/app.json ./ || true
           cp -n NativeTemp/index.js ./ || true
           rm -rf NativeTemp
 
+      - name: Configure React Native Node Environment
+        run: |
+          # Tells the "Bundle React Native code and images" phase exactly where Node is
+          echo "export NODE_BINARY=$(which node)" > ios/.xcode.env.local
+
       - name: Assemble UTM-QEMU Local Pod
         run: |
-          echo "Setting up local Pod directory..."
           mkdir -p ios/UTM-QEMU/Frameworks
           mkdir -p ios/UTM-QEMU/Sources
           mkdir -p ios/UTM-QEMU/Resources
           
           mkdir -p assets/guest
-          touch assets/guest/vmlinuz-virt assets/guest/initramfs-virt.cpio.gz
+          [ -f assets/guest/vmlinuz-virt ] || touch assets/guest/vmlinuz-virt
+          [ -f assets/guest/initramfs-virt.cpio.gz ] || touch assets/guest/initramfs-virt.cpio.gz
           cp assets/guest/vmlinuz-virt ios/UTM-QEMU/Resources/
           cp assets/guest/initramfs-virt.cpio.gz ios/UTM-QEMU/Resources/
           
@@ -126,16 +126,12 @@ jobs:
           EOF
           
           cd ios/UTM-QEMU
-          echo "Downloading precompiled UTM SE..."
           curl -L -o UTM-SE.zip https://github.com/utmapp/UTM/releases/download/v4.5.3/UTM-SE.ipa
           unzip -q UTM-SE.zip
-          
-          echo "Extracting dynamic frameworks..."
           mv Payload/*.app/Frameworks/*.framework ./Frameworks/
           find Frameworks -type d -name "qemu-*.framework" ! -name "qemu-aarch64-softmmu.framework" -exec rm -rf {} +
           rm -rf Payload UTM-SE.zip
 
-          echo "Generating Podspec..."
           cat << 'EOF' > UTM-QEMU.podspec
           Pod::Spec.new do |s|
             s.name         = "UTM-QEMU"
@@ -152,13 +148,10 @@ jobs:
           end
           EOF
 
-      - name: Configure Podfile for UTM-QEMU
+      - name: Configure Podfile
         run: |
           cd ios
-          # 1. Bump Podfile minimum iOS platform to 15.0
           perl -pi -e "s/platform :ios,.*/platform :ios, '15.0'/g" Podfile
-
-          # 2. Inject local UTM-QEMU pod into target block
           grep -q "UTM-QEMU" Podfile || perl -pi -e "s/(target 'MobileLinuxEditor' do)/\$1\n  pod 'UTM-QEMU', :path => '.\/UTM-QEMU'/g" Podfile
 
       - name: CocoaPods Install
@@ -169,6 +162,7 @@ jobs:
       - name: Compile iOS Archive
         run: |
           cd ios
+          set -o pipefail
           xcodebuild archive \
             -workspace MobileLinuxEditor.xcworkspace \
             -scheme MobileLinuxEditor \
@@ -176,10 +170,25 @@ jobs:
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -archivePath MobileLinuxEditor.xcarchive \
-            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO 2>&1 | tee xcodebuild.log || {
+              echo "=== BUILD FAILED: PRINTING ERROR SUMMARY ==="
+              grep -E -C 3 "error:|fatal error:|The following build commands failed" xcodebuild.log || tail -n 120 xcodebuild.log
+              exit 1
+            }
 
-      - name: Upload Build Artifact
+      - name: Package Unsigned IPA
+        run: |
+          mkdir -p build/Payload
+          cp -R ios/MobileLinuxEditor.xcarchive/Products/Applications/MobileLinuxEditor.app build/Payload/
+          cd build
+          zip -qr MobileLinuxEditor.ipa Payload
+          echo "IPA build completed successfully."
+
+      - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MobileLinuxEditor-xcarchive
-          path: ios/MobileLinuxEditor.xcarchive
+          name: MobileLinuxEditor-IPA
+          path: build/MobileLinuxEditor.ipa
