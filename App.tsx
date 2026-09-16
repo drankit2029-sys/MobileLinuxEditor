@@ -11,7 +11,7 @@ import {
   Alert,
 } from 'react-native';
 import { WebView } from 'react-native-webview';
-import RNFS from '@dr.pogodin/react-native-fs';
+import RNFS from 'react-native-fs';
 
 const ACCESSORY_KEYS = [
   'Tab', '{', '}', '(', ')', '[', ']', ';', ':', '=', 

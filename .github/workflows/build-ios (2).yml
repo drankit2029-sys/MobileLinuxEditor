@@ -1,27 +1,18 @@
 # MobileLinuxEditor - iOS CI build (React Native 0.74.5 + headless UTM-QEMU)
 #
-# ROOT CAUSE OF THE 2026-09-16 LINK CRASH:
-#   ld: symbol(s) not found for architecture arm64, referenced from
-#   _vm_thread_worker in libUTM-QEMU.a (LinuxVMBridge.o)
-# The bridge declared `extern int qemu_main(...)`, but UTM's QEMU frameworks
-# do NOT export `qemu_main`. Verified against utmapp/UTM sources
-# (Services/UTMQemuSystem.m, QEMULauncher/Bootstrap.c): UTM loads QEMU via
-#   dlopen("qemu-<arch>-softmmu.framework/qemu-<arch>-softmmu")
-#   dlsym("qemu_init")      -> int (int argc, const char *argv[], const char *envp[])
-#   dlsym("qemu_main_loop") -> void (void)
-#   dlsym("qemu_cleanup")   -> void (void)
-# then calls qemu_init(argc, argv, envp); qemu_main_loop(); qemu_cleanup();
-# This workflow's LinuxVMBridge.m now does exactly the same, so there are
-# ZERO link-time QEMU symbol dependencies and the link crash is gone.
+# v3: universal iPhone/iPad layout + launch-crash hardening
+#  - TARGETED_DEVICE_FAMILY = "1,2" (was iPhone-only -> tiny window on iPad)
+#  - Info.plist: UIRequiresFullScreen=true + all 4 iPad orientations
+#  - react-native-webview pinned to exact 13.10.5 (era-correct for RN 0.74;
+#    ^13.10.5 was resolving to 13.17, untested with RN 0.74, prime suspect
+#    for the instant-close-on-launch)
+#  - App.tsx import auto-fix: '@dr.pogodin/react-native-fs' -> 'react-native-fs'
+#    (removes dependence on the node_modules shim at Metro bundle time)
+#  - dSYM uploaded as artifact so any native crash can be symbolicated
 #
-# Also hardened in this version:
-#  - Xcode 15.4 selected explicitly (documented pairing for RN 0.74)
-#  - RN CLI pinned to 13.6.9 (@latest = v20 needs Node 20; runner has Node 18)
-#  - @react-native/babel-preset + @react-native/metro-config pinned to 0.74.89
-#    (latest targets RN 0.76+ and Metro bundling was never even reached yet,
-#     because the link failed first)
-#  - Fail-fast gate: verifies the qemu_init/main_loop/cleanup trio is
-#    exported by the downloaded framework BEFORE compiling
+# v2 root-cause fix (kept): QEMU is loaded via dlopen+dlsym trio
+# (qemu_init/qemu_main_loop/qemu_cleanup) exactly like UTM itself -
+# UTM's frameworks do NOT export qemu_main, which caused the link crash.
 name: Build iOS Native Package
 
 on:
@@ -62,7 +53,7 @@ jobs:
             pkg.dependencies["react"] = "18.2.0";
             pkg.dependencies["react-native"] = "0.74.5";
             pkg.dependencies["react-native-fs"] = "2.20.0";
-            if (!pkg.dependencies["react-native-webview"]) pkg.dependencies["react-native-webview"] = "^13.10.5";
+            pkg.dependencies["react-native-webview"] = "13.10.5";
             pkg.devDependencies["@react-native/babel-preset"] = "0.74.89";
             pkg.devDependencies["@react-native/metro-config"] = "0.74.89";
             fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
@@ -107,6 +98,15 @@ jobs:
               console.log("App.tsx starter written");
             } else {
               console.log("App.tsx already exists, kept as-is");
+            }
+            if (fs.existsSync("App.tsx")) {
+              let app = fs.readFileSync("App.tsx", "utf8");
+              if (app.includes("@dr.pogodin/react-native-fs")) {
+                app = app.split("from '@dr.pogodin/react-native-fs'").join("from 'react-native-fs'");
+                app = app.split('from "@dr.pogodin/react-native-fs"').join('from "react-native-fs"');
+                fs.writeFileSync("App.tsx", app);
+                console.log("App.tsx: @dr.pogodin import rewritten to react-native-fs");
+              }
             }
           NODEEOF
 
@@ -323,15 +323,35 @@ jobs:
           end
           EOF
 
-      - name: Configure iOS Deployment Target
+      - name: Configure iOS Deployment Target and Device Family
         run: |
           cd ios
           perl -pi -e "s/platform :ios,.*/platform :ios, '15.0'/g" Podfile
           grep -q "UTM-QEMU" Podfile || perl -pi -e "s/(target 'MobileLinuxEditor' do)/\$1\n  pod 'UTM-QEMU', :path => '.\/UTM-QEMU'/g" Podfile
           perl -pi -e "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;/IPHONEOS_DEPLOYMENT_TARGET = 15.0;/g" MobileLinuxEditor.xcodeproj/project.pbxproj
+          # Universal app: 1 = iPhone, 2 = iPad (template default is iPhone-only)
+          perl -pi -e "s/TARGETED_DEVICE_FAMILY = [^;]*;/TARGETED_DEVICE_FAMILY = \"1,2\";/g" MobileLinuxEditor.xcodeproj/project.pbxproj
+          echo "--- Device family now ---"
+          grep -m 2 "TARGETED_DEVICE_FAMILY" MobileLinuxEditor.xcodeproj/project.pbxproj
           echo "--- Podfile (top 30 lines) ---"
           head -n 30 Podfile
           pod --version
+
+      - name: Enable Universal iPhone+iPad Layout
+        run: |
+          cd ios
+          PLIST=MobileLinuxEditor/Info.plist
+          # Full-screen app (predictable canvas on iPhone + iPad, all orientations)
+          /usr/libexec/PlistBuddy -c "Add :UIRequiresFullScreen bool true" "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :UIRequiresFullScreen true" "$PLIST"
+          # All 4 orientations on iPad (idempotent rebuild of the array)
+          /usr/libexec/PlistBuddy -c "Delete :UISupportedInterfaceOrientations~ipad" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations~ipad array" "$PLIST"
+          for O in UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight; do
+            /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations~ipad: string $O" "$PLIST"
+          done
+          echo "--- iPad layout keys ---"
+          /usr/libexec/PlistBuddy -c "Print :UIRequiresFullScreen" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations~ipad" "$PLIST"
 
       - name: CocoaPods Install
         run: |
@@ -376,6 +396,12 @@ jobs:
         with:
           name: MobileLinuxEditor-IPA
           path: build/MobileLinuxEditor.ipa
+
+      - name: Upload dSYM Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MobileLinuxEditor-dSYM
+          path: ios/build_output/Build/Products/Release-iphoneos/*.dSYM
 
       - name: Upload full build log on failure
         if: failure()
