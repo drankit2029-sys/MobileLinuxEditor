@@ -1,96 +1,73 @@
-name: Build iOS Native Package
+#!/bin/sh
+set -e
 
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
+ALPINE_BRANCH="v3.20"
+ALPINE_VER="3.20.0"
+ARCH="aarch64"
+WORK_DIR="/tmp/guest-build"
+OUT_DIR="$(pwd)/../assets/guest"
 
-jobs:
-  build:
-    runs-on: macos-14
+mkdir -p "${WORK_DIR}" "${OUT_DIR}"
+cd "${WORK_DIR}"
 
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+echo "[1/4] Downloading Alpine Linux ARM64 minirootfs..."
+wget -q -c "http://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/releases/${ARCH}/alpine-minirootfs-${ALPINE_VER}-${ARCH}.tar.gz"
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 18
-          cache: 'npm'
+echo "[2/4] Extracting rootfs..."
+rm -rf rootfs
+mkdir -p rootfs
+tar -xzf "alpine-minirootfs-${ALPINE_VER}-${ARCH}.tar.gz" -C rootfs/
 
-      - name: Install NPM Dependencies
-        run: npm ci
+echo "[3/4] Creating bulletproof /init startup script..."
+cat << 'EOF' > rootfs/init
+#!/bin/sh
+# Mount pseudo-filesystems
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
 
-      - name: Assemble UTM-QEMU Local Pod
-        run: |
-          echo "Setting up local Pod directory..."
-          mkdir -p ios/UTM-QEMU/Frameworks
-          mkdir -p ios/UTM-QEMU/Sources
-          mkdir -p ios/UTM-QEMU/Resources
-          
-          # 1. Absorb the Native Bridge Code so CocoaPods compiles it automatically
-          mv ios/LinuxVMBridge.m ios/UTM-QEMU/Sources/ 2>/dev/null || true
-          
-          # 2. Absorb the Linux Guest Assets so CocoaPods bundles them
-          cp assets/guest/vmlinuz-virt ios/UTM-QEMU/Resources/
-          cp assets/guest/initramfs-virt.cpio.gz ios/UTM-QEMU/Resources/
-          
-          cd ios/UTM-QEMU
-          
-          echo "Downloading precompiled UTM SE..."
-          curl -L -o UTM-SE.zip https://github.com/utmapp/UTM/releases/download/v4.5.3/UTM-SE.ipa
-          unzip -q UTM-SE.zip
-          
-          echo "Extracting dynamic frameworks..."
-          mv Payload/*.app/Frameworks/*.framework ./Frameworks/
-          
-          # Remove all duplicate QEMU architectures to prevent linker crashes
-          find Frameworks -type d -name "qemu-*.framework" ! -name "qemu-aarch64-softmmu.framework" -exec rm -rf {} +
-          rm -rf Payload UTM-SE.zip
+# Configure SLiRP networking & DNS
+ifconfig lo 127.0.0.1 up
+udhcpc -i eth0 -q 2>/dev/null || true
+echo "nameserver 10.0.2.3" > /etc/resolv.conf
 
-          echo "Generating Podspec..."
-          cat << 'EOF' > UTM-QEMU.podspec
-          Pod::Spec.new do |s|
-            s.name         = "UTM-QEMU"
-            s.version      = "1.0.0"
-            s.summary      = "Prebuilt QEMU for iOS"
-            s.homepage     = "https://github.com/utmapp/UTM"
-            s.author       = "UTM"
-            s.source       = { :path => "." }
-            s.platform     = :ios, "14.0"
-            s.source_files = "Sources/*.{h,m,swift}"
-            s.resources    = "Resources/*"
-            s.vendored_frameworks = "Frameworks/*.framework"
-            s.dependency 'React-Core'
-          end
-          EOF
+# Setup HTTP repositories to bypass missing SSL certificates on initial boot
+cat << 'REPO' > /etc/apk/repositories
+http://dl-cdn.alpinelinux.org/alpine/v3.20/main
+http://dl-cdn.alpinelinux.org/alpine/v3.20/community
+REPO
 
-      - name: Inject Local Pod into Podfile
-        run: |
-          cd ios
-          # Safely injects the new UTM-QEMU pod directly into your React Native target
-          perl -pi -e "s/(target 'MobileLinuxEditor' do)/\$1\n  pod 'UTM-QEMU', :path => '.\/UTM-QEMU'/g" Podfile
+# Mount shared iOS host workspace directory via 9p VirtFS
+mkdir -p /root/workspace
+mount -t 9p -o trans=virtio,version=9p2000.L,msize=512000 host_workspace /root/workspace 2>/dev/null || true
 
-      - name: CocoaPods Install
-        run: |
-          cd ios
-          pod install
+export HOME=/root
+export TERM=vt100
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+cd /root
 
-      - name: Compile iOS Archive
-        run: |
-          cd ios
-          xcodebuild archive \
-            -workspace MobileLinuxEditor.xcworkspace \
-            -scheme MobileLinuxEditor \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -archivePath MobileLinuxEditor.xcarchive \
-            CODE_SIGNING_ALLOWED=NO
+echo ""
+echo "=== Alpine Linux ARM64 (iOS VM) ==="
+echo "Workspace mounted at /root/workspace"
+echo ""
+exec /bin/sh
+EOF
 
-      - name: Upload Build Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: MobileLinuxEditor-xcarchive
-          path: ios/MobileLinuxEditor.xcarchive
+chmod +x rootfs/init
+
+echo "[4/4] Packing initramfs and fetching kernel..."
+# Compatible with both BusyBox cpio and GNU cpio (-H newc -o)
+cd rootfs
+find . | cpio -H newc -o | gzip -9 > "${OUT_DIR}/initramfs-virt.cpio.gz"
+cd ..
+
+# Fetch official headless virt kernel
+wget -q -c "http://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/releases/${ARCH}/netboot/vmlinuz-virt" -O "${OUT_DIR}/vmlinuz-virt"
+
+# Clean up
+rm -rf "${WORK_DIR}"
+
+echo "SUCCESS: Assets generated at assets/guest/"
+ls -lh "${OUT_DIR}"

@@ -22,24 +22,104 @@ jobs:
       - name: Install NPM Dependencies
         run: npm ci
 
-      - name: Extract Prebuilt UTM-SE Frameworks
+      - name: Scaffold React Native iOS Project
+        run: |
+          echo "Generating pristine iOS scaffolding on macOS..."
+          # Unconditionally generate the template in a temp folder
+          npx @react-native-community/cli@latest init MobileLinuxEditor --version 0.74.5 --directory ./NativeTemp --skip-install
+          
+          # Ensure ios directory exists and merge the generated files (like Podfile)
+          mkdir -p ios
+          cp -R NativeTemp/ios/* ./ios/
+          cp -n NativeTemp/app.json ./ || true
+          cp -n NativeTemp/index.js ./ || true
+          rm -rf NativeTemp
+
+      - name: Assemble UTM-QEMU Local Pod
         run: |
           echo "Setting up local Pod directory..."
           mkdir -p ios/UTM-QEMU/Frameworks
-          cd ios/UTM-QEMU
+          mkdir -p ios/UTM-QEMU/Sources
+          mkdir -p ios/UTM-QEMU/Resources
           
+          # Bundle the Linux Guest Assets from the repo
+          cp assets/guest/vmlinuz-virt ios/UTM-QEMU/Resources/
+          cp assets/guest/initramfs-virt.cpio.gz ios/UTM-QEMU/Resources/
+          
+          # Inject the Native Bridge directly
+          cat << 'EOF' > ios/UTM-QEMU/Sources/LinuxVMBridge.m
+          #import <React/RCTBridgeModule.h>
+          #import <pthread.h>
+
+          extern int qemu_main(int argc, char **argv);
+
+          @interface LinuxVMBridge : NSObject <RCTBridgeModule>
+          @end
+
+          @implementation LinuxVMBridge { BOOL _isRunning; }
+
+          RCT_EXPORT_MODULE();
+
+          + (BOOL)requiresMainQueueSetup { return NO; }
+
+          static void *vm_thread_worker(void *arg) {
+              char **argv = (char **)arg;
+              int argc = 0;
+              while (argv[argc] != NULL) argc++;
+              qemu_main(argc, argv);
+              for (int i = 0; i < argc; i++) free(argv[i]);
+              free(argv);
+              return NULL;
+          }
+
+          RCT_EXPORT_METHOD(startVM:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+              if (_isRunning) { resolve(@"VM is already running"); return; }
+              
+              NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+              NSString *workspace = [docs stringByAppendingPathComponent:@"workspace"];
+              NSString *bundle = [[NSBundle mainBundle] bundlePath];
+              
+              [[NSFileManager defaultManager] createDirectoryAtPath:workspace withIntermediateDirectories:YES attributes:nil error:nil];
+              
+              NSArray<NSString *> *qemuArgs = @[
+                  @"qemu-system-aarch64", @"-M", @"virt", @"-cpu", @"cortex-a57", @"-smp", @"1", @"-m", @"512M",
+                  @"-kernel", [bundle stringByAppendingPathComponent:@"vmlinuz-virt"],
+                  @"-initrd", [bundle stringByAppendingPathComponent:@"initramfs-virt.cpio.gz"],
+                  @"-append", @"console=ttyAMA0 mitigations=off clocksource=arch_sys_counter quiet raid=noautodetect",
+                  @"-fsdev", [NSString stringWithFormat:@"local,id=ws,path=%@,security_model=none", workspace],
+                  @"-device", @"virtio-9p-pci,fsdev=ws,mount_tag=host_workspace",
+                  @"-netdev", @"user,id=net0,hostfwd=tcp::3000-:3000,hostfwd=tcp::5173-:5173",
+                  @"-device", @"virtio-net-pci,netdev=net0",
+                  @"-chardev", @"socket,id=serial0,port=4000,host=127.0.0.1,server=on,wait=off",
+                  @"-serial", @"chardev:serial0", @"-nographic"
+              ];
+              
+              int count = (int)[qemuArgs count];
+              char **argv = malloc(sizeof(char *) * (count + 1));
+              for (int i = 0; i < count; i++) argv[i] = strdup([[qemuArgs objectAtIndex:i] UTF8String]);
+              argv[count] = NULL;
+              
+              pthread_t thread;
+              if (pthread_create(&thread, NULL, vm_thread_worker, (void *)argv) != 0) {
+                  free(argv);
+                  reject(@"ERR_VM_THREAD", @"Failed to spawn QEMU pthread", nil);
+                  return;
+              }
+              pthread_detach(thread);
+              _isRunning = YES;
+              resolve(@"VM initialized on port 4000");
+          }
+          @end
+          EOF
+          
+          cd ios/UTM-QEMU
           echo "Downloading precompiled UTM SE..."
           curl -L -o UTM-SE.zip https://github.com/utmapp/UTM/releases/download/v4.5.3/UTM-SE.ipa
           unzip -q UTM-SE.zip
           
           echo "Extracting dynamic frameworks..."
           mv Payload/*.app/Frameworks/*.framework ./Frameworks/
-          
-          # CRITICAL: Remove all QEMU architectures EXCEPT aarch64-softmmu.
-          # If we keep the others, Xcode will crash with a "duplicate symbols" error.
           find Frameworks -type d -name "qemu-*.framework" ! -name "qemu-aarch64-softmmu.framework" -exec rm -rf {} +
-          
-          # Clean up
           rm -rf Payload UTM-SE.zip
 
           echo "Generating Podspec..."
@@ -52,21 +132,17 @@ jobs:
             s.author       = "UTM"
             s.source       = { :path => "." }
             s.platform     = :ios, "14.0"
+            s.source_files = "Sources/*.{h,m,swift}"
+            s.resources    = "Resources/*"
             s.vendored_frameworks = "Frameworks/*.framework"
+            s.dependency 'React-Core'
           end
           EOF
 
       - name: Inject Local Pod into Podfile
         run: |
           cd ios
-          # Safely injects the new UTM-QEMU pod directly into your React Native target
           perl -pi -e "s/(target 'MobileLinuxEditor' do)/\$1\n  pod 'UTM-QEMU', :path => '.\/UTM-QEMU'/g" Podfile
-          
-      - name: Prepare Guest OS Assets
-        run: |
-          mkdir -p ios/MobileLinuxEditor/GuestOS
-          cp assets/guest/vmlinuz-virt ios/MobileLinuxEditor/GuestOS/
-          cp assets/guest/initramfs-virt.cpio.gz ios/MobileLinuxEditor/GuestOS/
 
       - name: CocoaPods Install
         run: |
