@@ -22,71 +22,51 @@ jobs:
       - name: Install NPM Dependencies
         run: npm ci
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11' # 3.11 avoids several legacy build-dep quirks in UTM
-
-      - name: Install build tool dependencies
+      - name: Extract Prebuilt UTM-SE Frameworks
         run: |
-          pip install setuptools meson ninja
+          echo "Setting up local Pod directory..."
+          mkdir -p ios/UTM-QEMU/Frameworks
+          cd ios/UTM-QEMU
+          
+          echo "Downloading precompiled UTM SE..."
+          curl -L -o UTM-SE.zip https://github.com/utmapp/UTM/releases/download/v4.5.3/UTM-SE.ipa
+          unzip -q UTM-SE.zip
+          
+          echo "Extracting dynamic frameworks..."
+          mv Payload/*.app/Frameworks/*.framework ./Frameworks/
+          
+          # CRITICAL: Remove all QEMU architectures EXCEPT aarch64-softmmu.
+          # If we keep the others, Xcode will crash with a "duplicate symbols" error.
+          find Frameworks -type d -name "qemu-*.framework" ! -name "qemu-aarch64-softmmu.framework" -exec rm -rf {} +
+          
+          # Clean up
+          rm -rf Payload UTM-SE.zip
 
-      - name: Install Build Prerequisites
+          echo "Generating Podspec..."
+          cat << 'EOF' > UTM-QEMU.podspec
+          Pod::Spec.new do |s|
+            s.name         = "UTM-QEMU"
+            s.version      = "1.0.0"
+            s.summary      = "Prebuilt QEMU for iOS"
+            s.homepage     = "https://github.com/utmapp/UTM"
+            s.author       = "UTM"
+            s.source       = { :path => "." }
+            s.platform     = :ios, "14.0"
+            s.vendored_frameworks = "Frameworks/*.framework"
+          end
+          EOF
+
+      - name: Inject Local Pod into Podfile
         run: |
-          # Install all system-level tools required by UTM
-          brew install bison pkg-config gettext glib-utils libgpg-error nasm make meson cmake ninja
+          cd ios
+          # Safely injects the new UTM-QEMU pod directly into your React Native target
+          perl -pi -e "s/(target 'MobileLinuxEditor' do)/\$1\n  pod 'UTM-QEMU', :path => '.\/UTM-QEMU'/g" Podfile
           
-          # macOS ships with outdated versions of bison and gettext. Force the runner to use the new Homebrew versions.
-          echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
-          echo "$(brew --prefix gettext)/bin" >> $GITHUB_PATH
-          
-          # Install all required Python modules for QEMU and GLib code generation
-          pip3 install --break-system-packages six pyparsing pyyaml setuptools distlib mako
-
-      - name: Cache UTM Sysroot Dependencies
-        id: cache-sysroot
-        uses: actions/cache@v4
-        with:
-          path: sysroot-ios-tci-arm64
-          key: utm-sysroot-ios-tci-arm64
-
-      - name: Build UTM TCI Dependencies (if cache miss)
-        if: steps.cache-sysroot.outputs.cache-hit != 'true'
-        run: |
-          git clone --depth 1 https://github.com/utmapp/UTM.git _utm_build
-          cd _utm_build
-          
-          echo "Starting heavy compilation. Limiting threads to prevent Out-of-Memory crashes."
-          export MAKEFLAGS="-j3"
-          
-          # Route output to a file to prevent GitHub from killing the step due to log limits
-          ./scripts/build_dependencies.sh -p ios-tci -a arm64 > build_log.txt 2>&1 &
-          PID=$!
-          
-          # Keep the console alive so GitHub doesn't trigger the 10-minute inactivity timeout
-          while kill -0 $PID 2>/dev/null; do
-            echo "[$(date)] Working... Current task:"
-            tail -n 1 build_log.txt || true
-            sleep 60
-          done
-          
-          # Retrieve the final exit code of the build script
-          wait $PID
-          if [ $? -ne 0 ]; then
-            echo "== BUILD CRASHED =="
-            echo "Printing the last 200 lines of the log for debugging:"
-            tail -n 200 build_log.txt
-            exit 1
-          fi
-          
-          mv sysroot-ios-tci-arm64 ../
-          cd .. && rm -rf _utm_build
-
       - name: Prepare Guest OS Assets
         run: |
-          mkdir -p ios/Assets
-          cp assets/guest/vmlinuz-virt ios/Assets/
-          cp assets/guest/initramfs-virt.cpio.gz ios/Assets/
+          mkdir -p ios/MobileLinuxEditor/GuestOS
+          cp assets/guest/vmlinuz-virt ios/MobileLinuxEditor/GuestOS/
+          cp assets/guest/initramfs-virt.cpio.gz ios/MobileLinuxEditor/GuestOS/
 
       - name: CocoaPods Install
         run: |
