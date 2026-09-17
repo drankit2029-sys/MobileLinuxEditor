@@ -1,5 +1,8 @@
 # MobileLinuxEditor - iOS CI build (React Native 0.74.5 + headless UTM-QEMU)
 #
+# v5: real Alpine guest (netboot vmlinuz-virt + initramfs-virt, ~20MB);
+#     serial bridge (connectSerial/writeSerial/disconnectSerial +
+#     SerialData/VMStatus events), QEMU exit() guard, VM restart support.
 # v4: TARGETED_DEVICE_FAMILY replace-or-INSERT (template omits the key);
 #     minimal prune (ONLY EGL/GLESv2 are restricted; spice/virgl/epoxy are
 #     LC_LOADed by QEMU itself and must stay for runtime dlopen);
@@ -135,20 +138,31 @@ jobs:
           mkdir -p ios/UTM-QEMU/Sources
           mkdir -p ios/UTM-QEMU/Resources
 
+          # Real Alpine Linux guest (aarch64 virt netboot): kernel + initramfs.
+          # URLs verified live (~20MB total). -fSL fails loudly, never ships empty.
           mkdir -p assets/guest
-          [ -f assets/guest/vmlinuz-virt ] || touch assets/guest/vmlinuz-virt
-          [ -f assets/guest/initramfs-virt.cpio.gz ] || touch assets/guest/initramfs-virt.cpio.gz
+          curl -fSL -o assets/guest/vmlinuz-virt https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/netboot/vmlinuz-virt
+          curl -fSL -o assets/guest/initramfs-virt https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/netboot/initramfs-virt
+          ls -lh assets/guest/
           cp assets/guest/vmlinuz-virt ios/UTM-QEMU/Resources/
-          cp assets/guest/initramfs-virt.cpio.gz ios/UTM-QEMU/Resources/
+          cp assets/guest/initramfs-virt ios/UTM-QEMU/Resources/
 
           cat << 'EOF' > ios/UTM-QEMU/Sources/LinuxVMBridge.m
           #import <React/RCTBridgeModule.h>
+          #import <React/RCTEventEmitter.h>
+          #import <dispatch/dispatch.h>
           #import <pthread.h>
           #import <dlfcn.h>
+          #import <stdlib.h>
+          #import <string.h>
+          #import <unistd.h>
+          #import <sys/socket.h>
+          #import <netinet/in.h>
+          #import <arpa/inet.h>
 
           extern char **environ;
 
-          @interface LinuxVMBridge : NSObject <RCTBridgeModule>
+          @interface LinuxVMBridge : RCTEventEmitter <RCTBridgeModule>
           @end
 
           // UTM's QEMU frameworks expose NO link-time entry point. Like UTM itself
@@ -167,16 +181,69 @@ jobs:
               QEMUCleanupFunc qemu_cleanup;
               int argc;
               char **argv;
+              __unsafe_unretained LinuxVMBridge *module;
           } VMThreadArgs;
+
+          typedef struct {
+              __unsafe_unretained LinuxVMBridge *module;
+              int fd;
+          } SerialThreadArgs;
+
+          static pthread_t g_qemu_thread;
+          static BOOL g_qemu_thread_valid = NO;
+          static __unsafe_unretained LinuxVMBridge *g_module = nil;
+
+          @interface LinuxVMBridge ()
+          - (void)qemuDidExitWithStatus:(NSString *)status;
+          - (void)emitSerialData:(NSData *)data;
+          - (void)serialDidDisconnect;
+          @end
 
           @implementation LinuxVMBridge {
               BOOL _isRunning;
+              int _serialFd;
+              BOOL _serialConnected;
           }
 
           RCT_EXPORT_MODULE();
 
           + (BOOL)requiresMainQueueSetup {
               return NO;
+          }
+
+          - (instancetype)init {
+              self = [super init];
+              if (self) {
+                  _serialFd = -1;
+              }
+              return self;
+          }
+
+          - (NSArray<NSString *> *)supportedEvents {
+              return @[@"SerialData", @"VMStatus"];
+          }
+
+          - (void)qemuDidExitWithStatus:(NSString *)status {
+              _isRunning = NO;
+              g_qemu_thread_valid = NO;
+              [self sendEventWithName:@"VMStatus" body:@{@"status": status}];
+          }
+
+          - (void)emitSerialData:(NSData *)data {
+              if (!_serialConnected) {
+                  return;
+              }
+              NSString *b64 = [data base64EncodedStringWithOptions:0];
+              [self sendEventWithName:@"SerialData" body:@{@"data": b64}];
+          }
+
+          - (void)serialDidDisconnect {
+              if (_serialFd >= 0) {
+                  close(_serialFd);
+                  _serialFd = -1;
+              }
+              _serialConnected = NO;
+              [self sendEventWithName:@"VMStatus" body:@{@"status": @"serial-disconnected"}];
           }
 
           static void *vm_thread_worker(void *arg) {
@@ -192,7 +259,31 @@ jobs:
                   free(t->argv[i]);
               }
               free(t->argv);
+              LinuxVMBridge *module = t->module;
               free(t);
+              // QEMU returned (guest shutdown or init failure): notify JS + allow restart.
+              @autoreleasepool {
+                  [module qemuDidExitWithStatus:(ret == 0 ? @"exited" : @"init-failed")];
+              }
+              return NULL;
+          }
+
+          static void *serial_read_worker(void *arg) {
+              SerialThreadArgs *s = (SerialThreadArgs *)arg;
+              int fd = s->fd;
+              LinuxVMBridge *module = s->module;
+              free(s);
+              uint8_t buf[4096];
+              ssize_t n;
+              while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) {
+                  @autoreleasepool {
+                      NSData *data = [NSData dataWithBytes:buf length:(NSUInteger)n];
+                      [module emitSerialData:data];
+                  }
+              }
+              @autoreleasepool {
+                  [module serialDidDisconnect];
+              }
               return NULL;
           }
 
@@ -231,6 +322,22 @@ jobs:
                   return;
               }
 
+              // UTM-style guard (registered once): QEMU calls exit() on fatal errors.
+              // An exit on the VM thread becomes a thread exit so the app survives,
+              // and JS is told the VM died instead of hanging on "running".
+              g_module = self;
+              static dispatch_once_t onceToken;
+              dispatch_once(&onceToken, ^{
+                  atexit_b(^{
+                      if (g_qemu_thread_valid && pthread_equal(pthread_self(), g_qemu_thread)) {
+                          @autoreleasepool {
+                              [g_module qemuDidExitWithStatus:@"crashed"];
+                          }
+                          pthread_exit(NULL);
+                      }
+                  });
+              });
+
               NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
               NSString *workspace = [docs stringByAppendingPathComponent:@"workspace"];
               NSString *bundle = [[NSBundle mainBundle] bundlePath];
@@ -240,8 +347,8 @@ jobs:
               NSArray<NSString *> *qemuArgs = @[
                   @"qemu-system-aarch64", @"-M", @"virt", @"-cpu", @"cortex-a57", @"-smp", @"1", @"-m", @"512M",
                   @"-kernel", [bundle stringByAppendingPathComponent:@"vmlinuz-virt"],
-                  @"-initrd", [bundle stringByAppendingPathComponent:@"initramfs-virt.cpio.gz"],
-                  @"-append", @"console=ttyAMA0 mitigations=off clocksource=arch_sys_counter quiet raid=noautodetect",
+                  @"-initrd", [bundle stringByAppendingPathComponent:@"initramfs-virt"],
+                  @"-append", @"console=ttyAMA0 mitigations=off clocksource=arch_sys_counter raid=noautodetect",
                   @"-fsdev", [NSString stringWithFormat:@"local,id=ws,path=%@,security_model=none", workspace],
                   @"-device", @"virtio-9p-pci,fsdev=ws,mount_tag=host_workspace",
                   @"-netdev", @"user,id=net0,hostfwd=tcp::3000-:3000,hostfwd=tcp::5173-:5173",
@@ -261,6 +368,7 @@ jobs:
                   t->argv[i] = strdup([[qemuArgs objectAtIndex:i] UTF8String]);
               }
               t->argv[count] = NULL;
+              t->module = self;
 
               pthread_t thread;
               if (pthread_create(&thread, NULL, vm_thread_worker, t) != 0) {
@@ -273,10 +381,94 @@ jobs:
                   reject(@"ERR_VM_THREAD", @"Failed to spawn QEMU pthread", nil);
                   return;
               }
+              g_qemu_thread = thread;
+              g_qemu_thread_valid = YES;
               pthread_detach(thread);
               _isRunning = YES;
+              [self sendEventWithName:@"VMStatus" body:@{@"status": @"started"}];
               // NOTE: dlopen handle intentionally kept open for app lifetime (same as UTM).
               resolve(@"VM initialized on port 4000");
+          }
+
+          RCT_EXPORT_METHOD(connectSerial:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+              if (_serialConnected) {
+                  resolve(@"Serial already connected");
+                  return;
+              }
+              int fd = socket(AF_INET, SOCK_STREAM, 0);
+              if (fd < 0) {
+                  reject(@"ERR_SERIAL_SOCKET", @"socket() failed", nil);
+                  return;
+              }
+              struct sockaddr_in addr;
+              memset(&addr, 0, sizeof(addr));
+              addr.sin_family = AF_INET;
+              addr.sin_port = htons(4000);
+              addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+              if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+                  close(fd);
+                  reject(@"ERR_SERIAL_CONNECT", @"connect 127.0.0.1:4000 failed (is the VM running?)", nil);
+                  return;
+              }
+              _serialFd = fd;
+              _serialConnected = YES;
+              SerialThreadArgs *s = malloc(sizeof(SerialThreadArgs));
+              s->module = self;
+              s->fd = fd;
+              pthread_t thread;
+              if (pthread_create(&thread, NULL, serial_read_worker, s) != 0) {
+                  free(s);
+                  close(fd);
+                  _serialFd = -1;
+                  _serialConnected = NO;
+                  reject(@"ERR_SERIAL_THREAD", @"Failed to spawn serial reader", nil);
+                  return;
+              }
+              pthread_detach(thread);
+              [self sendEventWithName:@"VMStatus" body:@{@"status": @"serial-connected"}];
+              resolve(@"Serial connected on port 4000");
+          }
+
+          RCT_EXPORT_METHOD(disconnectSerial:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+              if (!_serialConnected) {
+                  resolve(@"Serial already disconnected");
+                  return;
+              }
+              // shutdown() unblocks the reader thread's recv(); it reports the disconnect.
+              _serialConnected = NO;
+              if (_serialFd >= 0) {
+                  shutdown(_serialFd, SHUT_RDWR);
+                  close(_serialFd);
+                  _serialFd = -1;
+              }
+              resolve(@"Serial disconnected");
+          }
+
+          RCT_EXPORT_METHOD(writeSerial:(NSString *)base64
+                            resolver:(RCTPromiseResolveBlock)resolve
+                            rejecter:(RCTPromiseRejectBlock)reject) {
+              if (!_serialConnected || _serialFd < 0) {
+                  reject(@"ERR_SERIAL_CLOSED", @"Serial not connected", nil);
+                  return;
+              }
+              NSData *data = [[NSData alloc] initWithBase64EncodedString:base64
+                                                                 options:NSDataBase64DecodingIgnoreUnknownCharacters];
+              if (!data || data.length == 0) {
+                  resolve(@0);
+                  return;
+              }
+              const uint8_t *bytes = (const uint8_t *)data.bytes;
+              NSUInteger total = data.length;
+              NSUInteger sent = 0;
+              while (sent < total) {
+                  ssize_t n = send(_serialFd, bytes + sent, total - sent, 0);
+                  if (n <= 0) {
+                      reject(@"ERR_SERIAL_WRITE", @"send() failed", nil);
+                      return;
+                  }
+                  sent += (NSUInteger)n;
+              }
+              resolve(@(sent));
           }
 
           @end
