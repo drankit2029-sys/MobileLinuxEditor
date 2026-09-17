@@ -1,5 +1,9 @@
 # MobileLinuxEditor - iOS CI build (React Native 0.74.5 + headless UTM-QEMU)
 #
+# v6: crash forensics + hardening - QEMU stderr piped live to the terminal AND
+#     to Documents/qemu-stderr.log (Files app can read it after a crash);
+#     guest pre-flight (sizes), no in-process restart, serial only when running,
+#     8MB VM thread stack, explicit -display none, UIFileSharingEnabled.
 # v5: real Alpine guest (netboot vmlinuz-virt + initramfs-virt, ~20MB);
 #     serial bridge (connectSerial/writeSerial/disconnectSerial +
 #     SerialData/VMStatus events), QEMU exit() guard, VM restart support.
@@ -154,6 +158,7 @@ jobs:
           #import <pthread.h>
           #import <dlfcn.h>
           #import <stdlib.h>
+          #import <stdio.h>
           #import <string.h>
           #import <unistd.h>
           #import <sys/socket.h>
@@ -189,6 +194,12 @@ jobs:
               int fd;
           } SerialThreadArgs;
 
+          typedef struct {
+              __unsafe_unretained LinuxVMBridge *module;
+              int fd;
+              FILE *logFile;
+          } StderrThreadArgs;
+
           static pthread_t g_qemu_thread;
           static BOOL g_qemu_thread_valid = NO;
           static __unsafe_unretained LinuxVMBridge *g_module = nil;
@@ -196,11 +207,13 @@ jobs:
           @interface LinuxVMBridge ()
           - (void)qemuDidExitWithStatus:(NSString *)status;
           - (void)emitSerialData:(NSData *)data;
+          - (void)emitStderrData:(NSData *)data;
           - (void)serialDidDisconnect;
           @end
 
           @implementation LinuxVMBridge {
               BOOL _isRunning;
+              BOOL _vmEverRan;
               int _serialFd;
               BOOL _serialConnected;
           }
@@ -246,6 +259,13 @@ jobs:
               [self sendEventWithName:@"VMStatus" body:@{@"status": @"serial-disconnected"}];
           }
 
+          // QEMU's own stderr (errors, aborts, boot diagnostics). Deliberately NOT
+          // gated on _serialConnected: most valuable exactly when serial never comes up.
+          - (void)emitStderrData:(NSData *)data {
+              NSString *b64 = [data base64EncodedStringWithOptions:0];
+              [self sendEventWithName:@"SerialData" body:@{@"data": b64}];
+          }
+
           static void *vm_thread_worker(void *arg) {
               VMThreadArgs *t = (VMThreadArgs *)arg;
               int ret = t->qemu_init(t->argc,
@@ -287,9 +307,34 @@ jobs:
               return NULL;
           }
 
+          static void *stderr_read_worker(void *arg) {
+              StderrThreadArgs *st = (StderrThreadArgs *)arg;
+              int fd = st->fd;
+              FILE *lf = st->logFile;
+              LinuxVMBridge *module = st->module;
+              free(st);
+              uint8_t buf[4096];
+              ssize_t n;
+              while ((n = read(fd, buf, sizeof(buf))) > 0) {
+                  @autoreleasepool {
+                      if (lf) {
+                          fwrite(buf, 1, (size_t)n, lf);
+                          fflush(lf);
+                      }
+                      NSData *data = [NSData dataWithBytes:buf length:(NSUInteger)n];
+                      [module emitStderrData:data];
+                  }
+              }
+              return NULL;
+          }
+
           RCT_EXPORT_METHOD(startVM:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
               if (_isRunning) {
                   resolve(@"VM is already running");
+                  return;
+              }
+              if (_vmEverRan) {
+                  reject(@"ERR_VM_RESTART", @"QEMU cannot boot twice in one process. Force-quit and reopen the app to boot again.", nil);
                   return;
               }
 
@@ -342,7 +387,18 @@ jobs:
               NSString *workspace = [docs stringByAppendingPathComponent:@"workspace"];
               NSString *bundle = [[NSBundle mainBundle] bundlePath];
 
-              [[NSFileManager defaultManager] createDirectoryAtPath:workspace withIntermediateDirectories:YES attributes:nil error:nil];
+              NSFileManager *fm = [NSFileManager defaultManager];
+              [fm createDirectoryAtPath:workspace withIntermediateDirectories:YES attributes:nil error:nil];
+
+              // Pre-flight: prove the guest files are really inside the bundle.
+              NSString *kernelPath = [bundle stringByAppendingPathComponent:@"vmlinuz-virt"];
+              NSString *initrdPath = [bundle stringByAppendingPathComponent:@"initramfs-virt"];
+              unsigned long long kSize = [[fm attributesOfItemAtPath:kernelPath error:nil] fileSize];
+              unsigned long long iSize = [[fm attributesOfItemAtPath:initrdPath error:nil] fileSize];
+              if (kSize == 0 || iSize == 0) {
+                  reject(@"ERR_VM_GUEST", [NSString stringWithFormat:@"Guest files missing/empty in bundle (kernel %llu, initrd %llu bytes)", kSize, iSize], nil);
+                  return;
+              }
 
               NSArray<NSString *> *qemuArgs = @[
                   @"qemu-system-aarch64", @"-M", @"virt", @"-cpu", @"cortex-a57", @"-smp", @"1", @"-m", @"512M",
@@ -354,8 +410,40 @@ jobs:
                   @"-netdev", @"user,id=net0,hostfwd=tcp::3000-:3000,hostfwd=tcp::5173-:5173",
                   @"-device", @"virtio-net-pci,netdev=net0",
                   @"-chardev", @"socket,id=serial0,port=4000,host=127.0.0.1,server=on,wait=off",
+                  @"-display", @"none",
                   @"-serial", @"chardev:serial0", @"-nographic"
               ];
+
+              // Capture QEMU's stderr into a pipe: a reader thread tees every byte
+              // to Documents/qemu-stderr.log (survives crashes, readable in Files app)
+              // and to the live terminal. If setup fails, restore and continue plain.
+              NSString *stderrLogPath = [docs stringByAppendingPathComponent:@"qemu-stderr.log"];
+              FILE *stderrLog = fopen([stderrLogPath UTF8String], "w");
+              int stderrPipe[2] = { -1, -1 };
+              int stderrOrig = -1;
+              if (stderrLog && pipe(stderrPipe) == 0) {
+                  stderrOrig = dup(STDERR_FILENO);
+                  dup2(stderrPipe[1], STDERR_FILENO);
+                  StderrThreadArgs *sa = malloc(sizeof(StderrThreadArgs));
+                  sa->module = self;
+                  sa->fd = stderrPipe[0];
+                  sa->logFile = stderrLog;
+                  pthread_t stderrThread;
+                  if (pthread_create(&stderrThread, NULL, stderr_read_worker, sa) == 0) {
+                      pthread_detach(stderrThread);
+                  } else {
+                      free(sa);
+                      if (stderrOrig >= 0) {
+                          dup2(stderrOrig, STDERR_FILENO);
+                          close(stderrOrig);
+                      }
+                      close(stderrPipe[0]);
+                      close(stderrPipe[1]);
+                      fclose(stderrLog);
+                  }
+              } else if (stderrLog) {
+                  fclose(stderrLog);
+              }
 
               int count = (int)[qemuArgs count];
               VMThreadArgs *t = calloc(1, sizeof(VMThreadArgs));
@@ -370,8 +458,13 @@ jobs:
               t->argv[count] = NULL;
               t->module = self;
 
+              pthread_attr_t vmAttr;
+              pthread_attr_init(&vmAttr);
+              pthread_attr_setstacksize(&vmAttr, 8 * 1024 * 1024);
               pthread_t thread;
-              if (pthread_create(&thread, NULL, vm_thread_worker, t) != 0) {
+              int vmCreateResult = pthread_create(&thread, &vmAttr, vm_thread_worker, t);
+              pthread_attr_destroy(&vmAttr);
+              if (vmCreateResult != 0) {
                   for (int i = 0; i < count; i++) {
                       free(t->argv[i]);
                   }
@@ -384,6 +477,7 @@ jobs:
               g_qemu_thread = thread;
               g_qemu_thread_valid = YES;
               pthread_detach(thread);
+              _vmEverRan = YES;
               _isRunning = YES;
               [self sendEventWithName:@"VMStatus" body:@{@"status": @"started"}];
               // NOTE: dlopen handle intentionally kept open for app lifetime (same as UTM).
@@ -391,6 +485,10 @@ jobs:
           }
 
           RCT_EXPORT_METHOD(connectSerial:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+              if (!_isRunning) {
+                  reject(@"ERR_VM_NOT_RUNNING", @"VM is not running", nil);
+                  return;
+              }
               if (_serialConnected) {
                   resolve(@"Serial already connected");
                   return;
@@ -557,6 +655,7 @@ jobs:
           PLIST=MobileLinuxEditor/Info.plist
           # Full-screen app (predictable canvas on iPhone + iPad, all orientations)
           /usr/libexec/PlistBuddy -c "Add :UIRequiresFullScreen bool true" "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :UIRequiresFullScreen true" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :UIFileSharingEnabled bool true" "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :UIFileSharingEnabled true" "$PLIST"
           # All 4 orientations on iPad (idempotent rebuild of the array)
           /usr/libexec/PlistBuddy -c "Delete :UISupportedInterfaceOrientations~ipad" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations~ipad array" "$PLIST"
