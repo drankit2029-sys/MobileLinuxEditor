@@ -1,5 +1,9 @@
 # MobileLinuxEditor - iOS CI build (React Native 0.74.5 + headless UTM-QEMU)
 #
+# v8: native patient serial auto-connect (JS only waited 6 s), -nographic replaced
+#     by -monitor none (nographic muxes the monitor onto stdio), QMP-backed stopVM
+#     (Stop really stops QEMU), [bridge] status lines printed into the terminal,
+#     EINTR-safe serial/stderr reader loops.
 # v7: fix "failed to find romfile efi-virtio.rom" - disable the virtio-net option
 #     ROM (romfile=). Those ROMs live in QEMU's pc-bios data dir (not shipped in
 #     the bundle) and are useless on ARM virt anyway: the guest uses native
@@ -166,6 +170,9 @@ jobs:
           #import <string.h>
           #import <unistd.h>
           #import <sys/socket.h>
+          #import <errno.h>
+          #import <sys/un.h>
+          #import <sys/time.h>
           #import <netinet/in.h>
           #import <arpa/inet.h>
 
@@ -213,6 +220,9 @@ jobs:
           - (void)emitSerialData:(NSData *)data;
           - (void)emitStderrData:(NSData *)data;
           - (void)serialDidDisconnect;
+          - (void)bridgeLog:(NSString *)line;
+          - (BOOL)vmRunning;
+          - (BOOL)tryConnectSerialOnce;
           @end
 
           @implementation LinuxVMBridge {
@@ -243,6 +253,7 @@ jobs:
           - (void)qemuDidExitWithStatus:(NSString *)status {
               _isRunning = NO;
               g_qemu_thread_valid = NO;
+              [self bridgeLog:[NSString stringWithFormat:@"[bridge] QEMU exited (%@). To boot again: force-quit and reopen the app.", status]];
               [self sendEventWithName:@"VMStatus" body:@{@"status": status}];
           }
 
@@ -299,16 +310,78 @@ jobs:
               free(s);
               uint8_t buf[4096];
               ssize_t n;
-              while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) {
-                  @autoreleasepool {
-                      NSData *data = [NSData dataWithBytes:buf length:(NSUInteger)n];
-                      [module emitSerialData:data];
+              for (;;) {
+                  n = recv(fd, buf, sizeof(buf), 0);
+                  if (n > 0) {
+                      @autoreleasepool {
+                          NSData *data = [NSData dataWithBytes:buf length:(NSUInteger)n];
+                          [module emitSerialData:data];
+                      }
+                      continue;
                   }
+                  if (n < 0 && errno == EINTR) {
+                      continue;
+                  }
+                  break;
               }
               @autoreleasepool {
                   [module serialDidDisconnect];
               }
               return NULL;
+          }
+
+          // v8: single owner of the serial TCP connect, shared by the JS
+          // connectSerial call and the patient native retry loop below.
+          - (BOOL)tryConnectSerialOnce {
+              if (_serialConnected) {
+                  return YES;
+              }
+              if (!_isRunning) {
+                  return NO;
+              }
+              int fd = socket(AF_INET, SOCK_STREAM, 0);
+              if (fd < 0) {
+                  return NO;
+              }
+              struct sockaddr_in addr;
+              memset(&addr, 0, sizeof(addr));
+              addr.sin_family = AF_INET;
+              addr.sin_port = htons(4000);
+              addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+              if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+                  close(fd);
+                  return NO;
+              }
+              _serialFd = fd;
+              _serialConnected = YES;
+              SerialThreadArgs *s = malloc(sizeof(SerialThreadArgs));
+              s->module = self;
+              s->fd = fd;
+              pthread_t thread;
+              if (pthread_create(&thread, NULL, serial_read_worker, s) != 0) {
+                  free(s);
+                  close(fd);
+                  _serialFd = -1;
+                  _serialConnected = NO;
+                  return NO;
+              }
+              pthread_detach(thread);
+              [self bridgeLog:@"[bridge] serial connected - waiting for guest output. Under CPU emulation the first kernel line can still take a few minutes."];
+              [self sendEventWithName:@"VMStatus" body:@{@"status": @"serial-connected"}];
+              return YES;
+          }
+
+          - (BOOL)vmRunning {
+              return _isRunning;
+          }
+
+          // A human-readable line into the terminal tab. Rides the same base64
+          // SerialData channel as stderr; the on-disk log carries QEMU's own
+          // stderr only (the tee sits in front of QEMU's pipe, not this path).
+          - (void)bridgeLog:(NSString *)line {
+              NSString *text = [line stringByAppendingString:@"\r\n"];
+              NSData *d = [text dataUsingEncoding:NSUTF8StringEncoding];
+              [self emitStderrData:d];
           }
 
           static void *stderr_read_worker(void *arg) {
@@ -319,15 +392,48 @@ jobs:
               free(st);
               uint8_t buf[4096];
               ssize_t n;
-              while ((n = read(fd, buf, sizeof(buf))) > 0) {
-                  @autoreleasepool {
-                      if (lf) {
-                          fwrite(buf, 1, (size_t)n, lf);
-                          fflush(lf);
+              for (;;) {
+                  n = read(fd, buf, sizeof(buf));
+                  if (n > 0) {
+                      @autoreleasepool {
+                          if (lf) {
+                              fwrite(buf, 1, (size_t)n, lf);
+                              fflush(lf);
+                          }
+                          NSData *data = [NSData dataWithBytes:buf length:(NSUInteger)n];
+                          [module emitStderrData:data];
                       }
-                      NSData *data = [NSData dataWithBytes:buf length:(NSUInteger)n];
-                      [module emitStderrData:data];
+                      continue;
                   }
+                  if (n < 0 && errno == EINTR) {
+                      continue;
+                  }
+                  break;
+              }
+              return NULL;
+          }
+
+          // v8: the JS startVM loop gave up after 6 s, but QEMU under TCI can take
+          // far longer just to open its chardev. Retry every 1 s for up to 10 min.
+          static void *serial_connect_worker(void *arg) {
+              SerialThreadArgs *c = (SerialThreadArgs *)arg;
+              LinuxVMBridge *module = c->module;
+              free(c);
+              for (int i = 0; i < 600; i++) {
+                  if (![module vmRunning]) {
+                      return NULL;
+                  }
+                  __block BOOL ok = NO;
+                  dispatch_sync(dispatch_get_main_queue(), ^{
+                      ok = [module tryConnectSerialOnce];
+                  });
+                  if (ok) {
+                      return NULL;
+                  }
+                  usleep(1000000);
+              }
+              if ([module vmRunning]) {
+                  [module bridgeLog:@"[bridge] serial socket never accepted a connection (10 min)."];
               }
               return NULL;
           }
@@ -403,6 +509,9 @@ jobs:
                   reject(@"ERR_VM_GUEST", [NSString stringWithFormat:@"Guest files missing/empty in bundle (kernel %llu, initrd %llu bytes)", kSize, iSize], nil);
                   return;
               }
+              NSString *qmpPath = [docs stringByAppendingPathComponent:@"qmp.sock"];
+              unlink([qmpPath UTF8String]);
+              [self bridgeLog:[NSString stringWithFormat:@"[bridge] guest files OK (kernel %llu KB, initrd %llu KB); starting QEMU...", kSize / 1024, iSize / 1024]];
 
               NSArray<NSString *> *qemuArgs = @[
                   @"qemu-system-aarch64", @"-M", @"virt", @"-cpu", @"cortex-a57", @"-smp", @"1", @"-m", @"512M",
@@ -417,7 +526,11 @@ jobs:
                   @"-device", @"virtio-net-pci,netdev=net0,romfile=",
                   @"-chardev", @"socket,id=serial0,port=4000,host=127.0.0.1,server=on,wait=off",
                   @"-display", @"none",
-                  @"-serial", @"chardev:serial0", @"-nographic"
+                  @"-serial", @"chardev:serial0",
+                  // v8: -nographic muxes the monitor onto stdio and can fight the
+                  // explicit -serial; kill it and expose QMP for clean shutdown.
+                  @"-monitor", @"none",
+                  @"-qmp", [NSString stringWithFormat:@"unix:%@,server=on,wait=off", qmpPath]
               ];
 
               // Capture QEMU's stderr into a pipe: a reader thread tees every byte
@@ -486,6 +599,16 @@ jobs:
               _vmEverRan = YES;
               _isRunning = YES;
               [self sendEventWithName:@"VMStatus" body:@{@"status": @"started"}];
+              [self bridgeLog:@"[bridge] QEMU thread launched. Boot text will appear in this terminal; under TCG expect minutes, not seconds."];
+              SerialThreadArgs *ca = malloc(sizeof(SerialThreadArgs));
+              ca->module = self;
+              ca->fd = -1;
+              pthread_t cthread;
+              if (pthread_create(&cthread, NULL, serial_connect_worker, ca) == 0) {
+                  pthread_detach(cthread);
+              } else {
+                  free(ca);
+              }
               // NOTE: dlopen handle intentionally kept open for app lifetime (same as UTM).
               resolve(@"VM initialized on port 4000");
           }
@@ -499,38 +622,11 @@ jobs:
                   resolve(@"Serial already connected");
                   return;
               }
-              int fd = socket(AF_INET, SOCK_STREAM, 0);
-              if (fd < 0) {
-                  reject(@"ERR_SERIAL_SOCKET", @"socket() failed", nil);
-                  return;
+              if ([self tryConnectSerialOnce]) {
+                  resolve(@"Serial connected on port 4000");
+              } else {
+                  reject(@"ERR_SERIAL_CONNECT", @"connect 127.0.0.1:4000 failed (native retry loop keeps trying)", nil);
               }
-              struct sockaddr_in addr;
-              memset(&addr, 0, sizeof(addr));
-              addr.sin_family = AF_INET;
-              addr.sin_port = htons(4000);
-              addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-              if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-                  close(fd);
-                  reject(@"ERR_SERIAL_CONNECT", @"connect 127.0.0.1:4000 failed (is the VM running?)", nil);
-                  return;
-              }
-              _serialFd = fd;
-              _serialConnected = YES;
-              SerialThreadArgs *s = malloc(sizeof(SerialThreadArgs));
-              s->module = self;
-              s->fd = fd;
-              pthread_t thread;
-              if (pthread_create(&thread, NULL, serial_read_worker, s) != 0) {
-                  free(s);
-                  close(fd);
-                  _serialFd = -1;
-                  _serialConnected = NO;
-                  reject(@"ERR_SERIAL_THREAD", @"Failed to spawn serial reader", nil);
-                  return;
-              }
-              pthread_detach(thread);
-              [self sendEventWithName:@"VMStatus" body:@{@"status": @"serial-connected"}];
-              resolve(@"Serial connected on port 4000");
           }
 
           RCT_EXPORT_METHOD(disconnectSerial:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
@@ -573,6 +669,71 @@ jobs:
                   sent += (NSUInteger)n;
               }
               resolve(@(sent));
+          }
+
+          // v8: real Stop. Ask QEMU itself to quit over QMP; works even when the
+          // guest sits at a login prompt and 'poweroff' typed to the serial does
+          // nothing. QEMU then unwinds and reports 'exited' through qemuDidExit.
+          RCT_EXPORT_METHOD(stopVM:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject) {
+              if (!_isRunning) {
+                  resolve(@"VM not running");
+                  return;
+              }
+              NSString *docs2 = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+              NSString *qmpPath2 = [docs2 stringByAppendingPathComponent:@"qmp.sock"];
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  int fd = -1;
+                  for (int i = 0; i < 40 && fd < 0; i++) {
+                      fd = socket(AF_UNIX, SOCK_STREAM, 0);
+                      if (fd < 0) {
+                          usleep(250000);
+                          continue;
+                      }
+                      struct sockaddr_un sa;
+                      memset(&sa, 0, sizeof(sa));
+                      sa.sun_family = AF_UNIX;
+                      strncpy(sa.sun_path, [qmpPath2 UTF8String], sizeof(sa.sun_path) - 1);
+                      if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+                          close(fd);
+                          fd = -1;
+                          usleep(250000);
+                      }
+                  }
+                  if (fd < 0) {
+                      reject(@"ERR_QMP_CONNECT", @"Could not connect to the QMP socket (QEMU may still be starting)", nil);
+                      return;
+                  }
+                  struct timeval tv;
+                  tv.tv_sec = 0;
+                  tv.tv_usec = 300000;
+                  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                  char drain[512];
+                  for (int i = 0; i < 6; i++) {
+                      ssize_t n = recv(fd, drain, sizeof(drain), 0);
+                      if (n <= 0) {
+                          break;
+                      }
+                  }
+                  const char *caps = "{\"execute\":\"qmp_capabilities\"}\n";
+                  const char *quit = "{\"execute\":\"quit\"}\n";
+                  if (write(fd, caps, strlen(caps)) < 0) {
+                      /* best effort: QEMU may already be gone */
+                  }
+                  for (int i = 0; i < 3; i++) {
+                      ssize_t n = recv(fd, drain, sizeof(drain), 0);
+                      if (n <= 0) {
+                          break;
+                      }
+                  }
+                  if (write(fd, quit, strlen(quit)) < 0) {
+                      close(fd);
+                      reject(@"ERR_QMP_WRITE", @"write to QMP failed", nil);
+                      return;
+                  }
+                  close(fd);
+                  [self bridgeLog:@"[bridge] QMP quit sent - QEMU shutting down"];
+                  resolve(@"quit sent");
+              });
           }
 
           @end

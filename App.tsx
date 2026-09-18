@@ -222,8 +222,10 @@ export default function App() {
           await sleep(500);
         }
       }
-      if (!connected) throw new Error('serial not answering');
-      setVmStatus('running');
+      // Native side now retries the serial connect for up to 10 min, so a
+      // miss here is not fatal; the 'serial-connected' VMStatus event will
+      // flip the pill to running whenever the socket comes up.
+      setVmStatus(connected ? 'running' : 'starting');
     } catch (err: any) {
       setVmStatus('error: ' + (err.message || err));
     }
@@ -232,9 +234,13 @@ export default function App() {
   const stopVM = async () => {
     if (!LinuxVMBridge) return;
     try {
-      // Graceful guest shutdown typed over the serial console.
-      await LinuxVMBridge.writeSerial(POWEROFF_B64);
+      // Graceful guest shutdown typed over the serial console; if the guest is
+      // not at a shell (e.g. login prompt) that never runs, so after a short
+      // grace period ask QEMU itself to quit via QMP (native stopVM).
+      try { await LinuxVMBridge.writeSerial(POWEROFF_B64); } catch (_) {}
       setVmStatus('shutting down');
+      await sleep(6000);
+      try { await LinuxVMBridge.stopVM(); } catch (_) {}
     } catch (err: any) {
       setVmStatus('error: ' + (err.message || err));
     }
