@@ -1,5 +1,11 @@
 # MobileLinuxEditor - iOS CI build (React Native 0.74.5 + headless UTM-QEMU)
 #
+# v9: silence-busting - keep the app awake while QEMU runs (iOS suspends all
+#     threads on auto-lock: 30 min of watch time can be seconds of emulation),
+#     earlycon on the kernel cmdline (prints from the very first boot stage,
+#     before the full UART driver exists), -no-reboot, argv echo into the
+#     terminal, and timed QMP 'query-status' probes (t+90s/7min/20min) that
+#     prove whether QEMU's main loop is alive even if the guest is silent.
 # v8: native patient serial auto-connect (JS only waited 6 s), -nographic replaced
 #     by -monitor none (nographic muxes the monitor onto stdio), QMP-backed stopVM
 #     (Stop really stops QEMU), [bridge] status lines printed into the terminal,
@@ -162,6 +168,7 @@ jobs:
           cat << 'EOF' > ios/UTM-QEMU/Sources/LinuxVMBridge.m
           #import <React/RCTBridgeModule.h>
           #import <React/RCTEventEmitter.h>
+          #import <UIKit/UIKit.h>
           #import <dispatch/dispatch.h>
           #import <pthread.h>
           #import <dlfcn.h>
@@ -253,6 +260,7 @@ jobs:
           - (void)qemuDidExitWithStatus:(NSString *)status {
               _isRunning = NO;
               g_qemu_thread_valid = NO;
+              [UIApplication sharedApplication].idleTimerDisabled = NO;
               [self bridgeLog:[NSString stringWithFormat:@"[bridge] QEMU exited (%@). To boot again: force-quit and reopen the app.", status]];
               [self sendEventWithName:@"VMStatus" body:@{@"status": status}];
           }
@@ -382,6 +390,99 @@ jobs:
               NSString *text = [line stringByAppendingString:@"\r\n"];
               NSData *d = [text dataUsingEncoding:NSUTF8StringEncoding];
               [self emitStderrData:d];
+          }
+
+          // One-shot QMP conversation: greeting -> capabilities -> command -> read.
+          // Returns the first response line, or nil on any failure. Blocking by
+          // design; only ever called from background queues.
+          static NSString *QMPTransact(NSString *sockPath, NSString *cmd) {
+              int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+              if (fd < 0) {
+                  return nil;
+              }
+              struct sockaddr_un sa;
+              memset(&sa, 0, sizeof(sa));
+              sa.sun_family = AF_UNIX;
+              strncpy(sa.sun_path, [sockPath UTF8String], sizeof(sa.sun_path) - 1);
+              BOOL connected = NO;
+              for (int i = 0; i < 12 && !connected; i++) {
+                  if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+                      connected = YES;
+                  } else {
+                      usleep(250000);
+                  }
+              }
+              if (!connected) {
+                  close(fd);
+                  return nil;
+              }
+              struct timeval tv;
+              tv.tv_sec = 0;
+              tv.tv_usec = 500000;
+              setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+              char buf[512];
+              for (int i = 0; i < 4; i++) {
+                  if (recv(fd, buf, sizeof(buf), 0) <= 0) {
+                      break;
+                  }
+              }
+              const char *caps = "{\"execute\":\"qmp_capabilities\"}\n";
+              if (write(fd, caps, strlen(caps)) < 0) {
+                  close(fd);
+                  return nil;
+              }
+              for (int i = 0; i < 2; i++) {
+                  if (recv(fd, buf, sizeof(buf), 0) <= 0) {
+                      break;
+                  }
+              }
+              NSMutableString *cmdline = [cmd mutableCopy];
+              [cmdline appendString:@"\n"];
+              const char *cbytes = [cmdline UTF8String];
+              if (write(fd, cbytes, strlen(cbytes)) < 0) {
+                  close(fd);
+                  return nil;
+              }
+              NSMutableData *resp = [NSMutableData data];
+              for (int i = 0; i < 8; i++) {
+                  ssize_t n = recv(fd, buf, sizeof(buf), 0);
+                  if (n <= 0) {
+                      break;
+                  }
+                  [resp appendBytes:buf length:(NSUInteger)n];
+              }
+              close(fd);
+              return [[NSString alloc] initWithData:resp encoding:NSUTF8StringEncoding];
+          }
+
+          // Timed heartbeat that answers "is QEMU's main loop alive?" without
+          // needing the guest to cooperate. (If the app was suspended when these
+          // fire, the lines appear only once it is foregrounded again - that
+          // lurch in timestamps is itself the suspension signature.)
+          - (void)probeQMPAfter:(NSTimeInterval)delay tag:(NSString *)tag {
+              NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+              NSString *path = [docs stringByAppendingPathComponent:@"qmp.sock"];
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                             dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                  if (!self->_isRunning) {
+                      return;
+                  }
+                  NSString *r = QMPTransact(path, @"{\"execute\":\"query-status\"}");
+                  NSString *s = r ? r : @"(no answer)";
+                  NSRange nl = [s rangeOfCharacterFromSet:[NSCharacterSet newlineCharacterSet]];
+                  if (nl.location != NSNotFound) {
+                      s = [s substringToIndex:nl.location];
+                  }
+                  if (s.length > 300) {
+                      s = [s substringToIndex:300];
+                  }
+                  NSString *line = [NSString stringWithFormat:@"[bridge] probe %@: QMP query-status -> %@", tag, s];
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      if (self->_isRunning) {
+                          [self bridgeLog:line];
+                      }
+                  });
+              });
           }
 
           static void *stderr_read_worker(void *arg) {
@@ -515,9 +616,14 @@ jobs:
 
               NSArray<NSString *> *qemuArgs = @[
                   @"qemu-system-aarch64", @"-M", @"virt", @"-cpu", @"cortex-a57", @"-smp", @"1", @"-m", @"512M",
+                  @"-no-reboot",
                   @"-kernel", [bundle stringByAppendingPathComponent:@"vmlinuz-virt"],
                   @"-initrd", [bundle stringByAppendingPathComponent:@"initramfs-virt"],
-                  @"-append", @"console=ttyAMA0 mitigations=off clocksource=arch_sys_counter raid=noautodetect",
+                  // earlycon = kernel prints from its first instructions via the
+                  // PL011 registers, long before the real console driver loads.
+                  // If the guest boots at all, we SEE it. clocksource pin removed:
+                  // under TCG it can stall early boot if the timer DT is odd.
+                  @"-append", @"earlycon console=ttyAMA0 mitigations=off raid=noautodetect",
                   @"-fsdev", [NSString stringWithFormat:@"local,id=ws,path=%@,security_model=none", workspace],
                   @"-device", @"virtio-9p-pci,fsdev=ws,mount_tag=host_workspace",
                   @"-netdev", @"user,id=net0,hostfwd=tcp::3000-:3000,hostfwd=tcp::5173-:5173",
@@ -532,6 +638,7 @@ jobs:
                   @"-monitor", @"none",
                   @"-qmp", [NSString stringWithFormat:@"unix:%@,server=on,wait=off", qmpPath]
               ];
+              [self bridgeLog:[NSString stringWithFormat:@"[bridge] argv: %@", [qemuArgs componentsJoinedByString:@" "]]];
 
               // Capture QEMU's stderr into a pipe: a reader thread tees every byte
               // to Documents/qemu-stderr.log (survives crashes, readable in Files app)
@@ -599,6 +706,13 @@ jobs:
               _vmEverRan = YES;
               _isRunning = YES;
               [self sendEventWithName:@"VMStatus" body:@{@"status": @"started"}];
+              // iOS suspends every thread when the display sleeps: keep the app
+              // foreground-awake while the VM runs, or "30 min of booting" is
+              // really 30 seconds with the screen off.
+              [UIApplication sharedApplication].idleTimerDisabled = YES;
+              [self probeQMPAfter:90 tag:@"t+90s"];
+              [self probeQMPAfter:420 tag:@"t+7min"];
+              [self probeQMPAfter:1200 tag:@"t+20min"];
               [self bridgeLog:@"[bridge] QEMU thread launched. Boot text will appear in this terminal; under TCG expect minutes, not seconds."];
               SerialThreadArgs *ca = malloc(sizeof(SerialThreadArgs));
               ca->module = self;
