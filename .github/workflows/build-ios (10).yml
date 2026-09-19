@@ -1,5 +1,9 @@
 # MobileLinuxEditor - iOS CI build (React Native 0.74.5 + headless UTM-QEMU)
 #
+# v10: fix the v9 regression - UIApplication in qemuDidExitWithStatus ran on the
+#      VM thread (Main Thread Checker abort, .ips lost inside exit()) -> all UIKit
+#      now hops to main. -qmp rewritten as proven -chardev socket + -mon so a
+#      parser quirk can't kill init. bridgeLog tees to the on-disk log too.
 # v9: silence-busting - keep the app awake while QEMU runs (iOS suspends all
 #     threads on auto-lock: 30 min of watch time can be seconds of emulation),
 #     earlycon on the kernel cmdline (prints from the very first boot stage,
@@ -221,6 +225,7 @@ jobs:
           static pthread_t g_qemu_thread;
           static BOOL g_qemu_thread_valid = NO;
           static __unsafe_unretained LinuxVMBridge *g_module = nil;
+          static FILE *g_stderrLog = NULL;
 
           @interface LinuxVMBridge ()
           - (void)qemuDidExitWithStatus:(NSString *)status;
@@ -260,8 +265,13 @@ jobs:
           - (void)qemuDidExitWithStatus:(NSString *)status {
               _isRunning = NO;
               g_qemu_thread_valid = NO;
-              [UIApplication sharedApplication].idleTimerDisabled = NO;
-              [self bridgeLog:[NSString stringWithFormat:@"[bridge] QEMU exited (%@). To boot again: force-quit and reopen the app.", status]];
+              // v10: this method runs on QEMU's VM thread and inside atexit
+              // context. UIKit (idle timer) is main-thread-only; a direct call
+              // trips the Main Thread Checker and aborts the app mid-exit.
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  [UIApplication sharedApplication].idleTimerDisabled = NO;
+                  [self bridgeLog:[NSString stringWithFormat:@"[bridge] QEMU exited (%@). To boot again: force-quit and reopen the app.", status]];
+              });
               [self sendEventWithName:@"VMStatus" body:@{@"status": status}];
           }
 
@@ -387,6 +397,14 @@ jobs:
           // SerialData channel as stderr; the on-disk log carries QEMU's own
           // stderr only (the tee sits in front of QEMU's pipe, not this path).
           - (void)bridgeLog:(NSString *)line {
+              // v10: tee to the on-disk log as well, so the whole [bridge] story
+              // survives an app crash and can be read afterwards from
+              // Files -> MobileLinuxEditor -> qemu-stderr.log.
+              FILE *lf = g_stderrLog;
+              if (lf) {
+                  fprintf(lf, "%s\n", [line UTF8String]);
+                  fflush(lf);
+              }
               NSString *text = [line stringByAppendingString:@"\r\n"];
               NSData *d = [text dataUsingEncoding:NSUTF8StringEncoding];
               [self emitStderrData:d];
@@ -460,8 +478,7 @@ jobs:
           // fire, the lines appear only once it is foregrounded again - that
           // lurch in timestamps is itself the suspension signature.)
           - (void)probeQMPAfter:(NSTimeInterval)delay tag:(NSString *)tag {
-              NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-              NSString *path = [docs stringByAppendingPathComponent:@"qmp.sock"];
+              NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"qmp.sock"];
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                              dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                   if (!self->_isRunning) {
@@ -610,7 +627,9 @@ jobs:
                   reject(@"ERR_VM_GUEST", [NSString stringWithFormat:@"Guest files missing/empty in bundle (kernel %llu, initrd %llu bytes)", kSize, iSize], nil);
                   return;
               }
-              NSString *qmpPath = [docs stringByAppendingPathComponent:@"qmp.sock"];
+              // tmp/, not Documents/: sun_path holds 104 bytes and iOS
+              // Documents paths sit right at that edge.
+              NSString *qmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"qmp.sock"];
               unlink([qmpPath UTF8String]);
               [self bridgeLog:[NSString stringWithFormat:@"[bridge] guest files OK (kernel %llu KB, initrd %llu KB); starting QEMU...", kSize / 1024, iSize / 1024]];
 
@@ -631,12 +650,16 @@ jobs:
                   // we don't ship; pointless on ARM virt, Linux has virtio drivers).
                   @"-device", @"virtio-net-pci,netdev=net0,romfile=",
                   @"-chardev", @"socket,id=serial0,port=4000,host=127.0.0.1,server=on,wait=off",
+                  // v10: QMP as a plain socket chardev + -mon backend (the exact
+                  // option syntax proven to parse for the serial line above),
+                  // instead of the dedicated -qmp spelling its parser rejected.
+                  @"-chardev", [NSString stringWithFormat:@"socket,id=qmp0,path=%@,server=on,wait=off", qmpPath],
+                  @"-mon", @"chardev=qmp0,mode=control",
                   @"-display", @"none",
                   @"-serial", @"chardev:serial0",
                   // v8: -nographic muxes the monitor onto stdio and can fight the
                   // explicit -serial; kill it and expose QMP for clean shutdown.
-                  @"-monitor", @"none",
-                  @"-qmp", [NSString stringWithFormat:@"unix:%@,server=on,wait=off", qmpPath]
+                  @"-monitor", @"none"
               ];
               [self bridgeLog:[NSString stringWithFormat:@"[bridge] argv: %@", [qemuArgs componentsJoinedByString:@" "]]];
 
@@ -657,6 +680,7 @@ jobs:
                   pthread_t stderrThread;
                   if (pthread_create(&stderrThread, NULL, stderr_read_worker, sa) == 0) {
                       pthread_detach(stderrThread);
+                      g_stderrLog = stderrLog;
                   } else {
                       free(sa);
                       if (stderrOrig >= 0) {
@@ -793,8 +817,7 @@ jobs:
                   resolve(@"VM not running");
                   return;
               }
-              NSString *docs2 = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-              NSString *qmpPath2 = [docs2 stringByAppendingPathComponent:@"qmp.sock"];
+              NSString *qmpPath2 = [NSTemporaryDirectory() stringByAppendingPathComponent:@"qmp.sock"];
               dispatch_async(dispatch_get_main_queue(), ^{
                   int fd = -1;
                   for (int i = 0; i < 40 && fd < 0; i++) {
